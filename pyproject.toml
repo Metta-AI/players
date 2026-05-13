@@ -19,6 +19,9 @@ dependencies = [
 cogames = ["cogames", "mettagrid"]
 test = ["pytest", "pytest-xdist", "ruff"]
 
+[project.entry-points."mettagrid.policy_aliases"]
+agent-policies = "agent_policies.policy_catalog:get_policy_aliases"
+
 [tool.setuptools]
 include-package-data = true
 
