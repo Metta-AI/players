@@ -1,19 +1,8 @@
-"""CoGames AmongThem policy wrapper around the guided_bot Nim library.
+"""Coworld policy wrapper around the guided_bot Nim library.
 
-The tournament worker imports this as ``amongthem_policy.AmongThemPolicy``.
-It:
-
-1. Locates the ``guided_bot`` source tree in either source or bundle layout.
-2. Imports ``build_guided_bot`` and builds ``libguidedbot.{dylib,so,dll}``
-   on demand.
-3. Loads the library via ctypes and routes ``step_batch`` through
-   ``guidedbot_step_batch``.
-
-Mirrors ``modulabot/cogames/amongthem_policy.py`` — keep in lockstep when
-the BitWorld policy interface changes.
-
-Phase 0: the wrapper compiles the library and routes the action batch
-through, but the Nim side returns no-op for every agent.
+The public Among Them image imports this as ``amongthem_policy.AmongThemPolicy``.
+It locates the guided_bot source tree, builds/loads ``libguidedbot``, and routes
+Coworld player observations through the Nim FFI.
 """
 
 from __future__ import annotations
@@ -28,9 +17,6 @@ from types import ModuleType
 
 import numpy as np
 
-# BitWorld constants — try the bitworld package first, fall back to
-# inline values so the policy works in Docker images that only have
-# mettagrid (no bitworld extra).
 try:
     from mettagrid.bitworld import (
         BITWORLD_ACTION_COUNT,
@@ -42,15 +28,33 @@ except ImportError:
     SCREEN_WIDTH = 128
     SCREEN_HEIGHT = 128
     BITWORLD_ACTION_NAMES = (
-        "noop", "a", "b",
-        "up", "up+a", "up+b",
-        "down", "down+a", "down+b",
-        "left", "left+a", "left+b",
-        "right", "right+a", "right+b",
-        "up+left", "up+left+a", "up+left+b",
-        "up+right", "up+right+a", "up+right+b",
-        "down+left", "down+left+a", "down+left+b",
-        "down+right", "down+right+a", "down+right+b",
+        "noop",
+        "a",
+        "b",
+        "up",
+        "up+a",
+        "up+b",
+        "down",
+        "down+a",
+        "down+b",
+        "left",
+        "left+a",
+        "left+b",
+        "right",
+        "right+a",
+        "right+b",
+        "up+left",
+        "up+left+a",
+        "up+left+b",
+        "up+right",
+        "up+right+a",
+        "up+right+b",
+        "down+left",
+        "down+left+a",
+        "down+left+b",
+        "down+right",
+        "down+right+a",
+        "down+right+b",
     )
     BITWORLD_ACTION_COUNT = len(BITWORLD_ACTION_NAMES)
 
@@ -60,17 +64,7 @@ from mettagrid.simulator import Action, AgentObservation
 
 
 def _find_guided_bot_dir() -> Path:
-    """Returns the directory containing ``build_guided_bot.py``.
-
-    Source layout: this file lives at
-    ``among_them/guided_bot/cogames/amongthem_policy.py``; the guided_bot
-    directory is one level up.
-
-    Bundle layout: ``cogames ship`` flattens this file (its basename
-    matches the policy module name) to the bundle root. Sibling ``-f``
-    includes preserve their relative paths, so the guided_bot tree ends
-    up at ``<bundle_root>/among_them/guided_bot``.
-    """
+    """Return the directory containing ``build_guided_bot.py``."""
     here = Path(__file__).resolve().parent
     candidates = [
         here.parent,
@@ -95,9 +89,7 @@ def _import_build(guided_bot_dir: Path) -> ModuleType:
         module_name, guided_bot_dir / "build_guided_bot.py"
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(
-            f"Could not load build_guided_bot.py from {guided_bot_dir}"
-        )
+        raise RuntimeError(f"Could not load build_guided_bot.py from {guided_bot_dir}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -124,16 +116,16 @@ class _GuidedBotAgentPolicy(AgentPolicy):
 
 
 class AmongThemPolicy(MultiAgentPolicy):
-    """Runs `guided_bot.nim` through the compiled shared library.
-
-    Action space must match the BitWorld AmongThem trainable set; the
-    Nim side enforces the same table at
-    ``among_them/guided_bot/ffi/lib.nim:TrainableMasks``.
-    """
+    """Runs guided_bot through the compiled shared library."""
 
     short_names = ["amongthem_guided_bot"]
 
-    def __init__(self, policy_env_info: PolicyEnvInterface, device: str = "cpu", **kwargs):
+    def __init__(
+        self,
+        policy_env_info: PolicyEnvInterface,
+        device: str = "cpu",
+        **kwargs,
+    ):
         super().__init__(policy_env_info, device=device)
         if tuple(policy_env_info.action_names) != BITWORLD_ACTION_NAMES:
             raise ValueError(
@@ -164,15 +156,17 @@ class AmongThemPolicy(MultiAgentPolicy):
             ctypes.c_int,
         ]
         self._lib.guidedbot_take_chat.restype = ctypes.c_int
-        # Destroy export — optional (additive FFI, may be absent in old libs).
         self._destroy_fn = getattr(self._lib, "guidedbot_destroy_policy", None)
         if self._destroy_fn is not None:
             self._destroy_fn.argtypes = [ctypes.c_int]
             self._destroy_fn.restype = None
-        # Trace-dir override export — additive, may be absent in old libs.
         self._set_trace_dir_fn = getattr(self._lib, "guidedbot_set_trace_dir", None)
         if self._set_trace_dir_fn is not None:
-            self._set_trace_dir_fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
+            self._set_trace_dir_fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+            ]
             self._set_trace_dir_fn.restype = None
         self._num_agents = max(1, int(policy_env_info.num_agents))
         self._handle = int(self._lib.guidedbot_new_policy(self._num_agents))
@@ -181,9 +175,6 @@ class AmongThemPolicy(MultiAgentPolicy):
         self._pending_chat: dict[int, str] = {}
         self._chat_buf = ctypes.create_string_buffer(256)
 
-        # Per-instance trace override: kwarg wins over env var.
-        # When set, closes existing env-var-derived trace writers and
-        # reopens with the specified directory.
         trace_dir = kwargs.get("trace_dir")
         trace_level = kwargs.get("trace_level", "decisions")
         if trace_dir:
@@ -202,13 +193,7 @@ class AmongThemPolicy(MultiAgentPolicy):
         agent_ids: Sequence[int],
         raw_observations: np.ndarray,
     ) -> np.ndarray:
-        """Step a subset of slots with raw BitWorld pixel observations.
-
-        Coworld launches one policy container per player slot, while the
-        historical BitWorld runner calls ``step_batch`` with all slots at
-        once. This helper preserves the true slot id without forcing the
-        Coworld bridge to send zero frames for every other agent.
-        """
+        """Step a subset of slots with raw BitWorld pixel observations."""
         observations = self._normalize_observations(raw_observations)
         batch_size = observations.shape[0]
         agent_ids_array = np.asarray(list(agent_ids), dtype=np.int32)
@@ -246,36 +231,18 @@ class AmongThemPolicy(MultiAgentPolicy):
         return 0
 
     def take_chat(self, agent_id: int) -> str:
-        """Pop one pending chat line for local runners."""
+        """Pop one pending chat line for Coworld protocol responses."""
         return self._pending_chat.pop(agent_id, "")
 
-    def last_chat(self, agent_id: int) -> str:
-        """Compatibility hook used by local Among Them scripts."""
-        return self.take_chat(agent_id)
-
     def bitworld_chat_messages(self, agent_ids) -> list[str | None]:
-        """Batched chat hook used by mettagrid's BitWorld runner."""
+        """Batched chat hook used by mettagrid BitWorld runners."""
         messages: list[str | None] = []
         for agent_id in agent_ids:
             text = self._pending_chat.pop(int(agent_id), "")
             messages.append(text if text else None)
         return messages
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     def _set_trace_dir(self, trace_dir: str, trace_level: str = "decisions") -> None:
-        """Override trace output directory for all bots in this policy.
-
-        Closes any existing trace writers (opened via env var during
-        initBot) and reopens with the specified directory. Each bot
-        gets a unique session subdirectory via the Nim-side instance
-        counter.
-
-        No-op if the library doesn't export guidedbot_set_trace_dir
-        (old builds without this feature).
-        """
         if self._set_trace_dir_fn is None:
             return
         self._set_trace_dir_fn(
@@ -303,10 +270,8 @@ class AmongThemPolicy(MultiAgentPolicy):
             self._pending_chat[agent_id] = text
 
     def close(self, *, reason: str = "session_end") -> None:
-        """Tear down the Nim policy: stops guidance worker, flushes traces.
-
-        Safe to call multiple times.
-        """
+        """Tear down the Nim policy: stops guidance worker, flushes traces."""
+        del reason
         if self._closed:
             return
         self._closed = True
@@ -314,8 +279,6 @@ class AmongThemPolicy(MultiAgentPolicy):
             self._destroy_fn(self._handle)
 
     def __del__(self) -> None:
-        # Best-effort finalizer so traces get flushed even if close()
-        # is never called explicitly.  Mirrors modulabot/policy.py.
         try:
             self.close()
         except Exception:
@@ -372,12 +335,6 @@ class AmongThemPolicy(MultiAgentPolicy):
         return self._source_tree_newer_than(lib_path)
 
     def _source_tree_newer_than(self, lib_path: Path) -> bool:
-        """Return True when source inputs are newer than the shared library.
-
-        The ABI stamp catches intentional FFI changes, but guided_bot is
-        mostly Nim strategy/perception code. Rebuild locally when those
-        files move so an old no-op dylib cannot silently shadow fresh source.
-        """
         try:
             lib_mtime = lib_path.stat().st_mtime
         except OSError:
