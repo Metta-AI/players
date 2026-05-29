@@ -345,7 +345,7 @@ re-decides.
 
 | Mode | Active when | Intents emitted |
 |---|---|---|
-| **Normal** | default while `Playing` | `complete_task(T)` (pick → emit until belief shows T done → pick next); `idle`/`loiter` if none left |
+| **Normal** | default while `Playing` | target the nearest reachable **signalled** task (live arrows+bubbles = the remaining tasks) and `complete_task(T)`; conclude `T` done when its **bubble disappears**, gated on having seen ≥ `COMPLETION_PROGRESS_PCT` (≈90%) progress (so an occlusion/edge flicker doesn't false-complete); when **no task signal remains**, `navigate_to` the spawn / **start room** rather than standing still |
 | **Attend Meeting** | phase = `Voting` | `chat(text)`, then `vote(choice)` before the timer |
 | **Report Body** | a body is in view | `report(body_id)`; yields when a meeting opens |
 | **Flee** | a believed-imposter is approaching | `flee_from(player)`, or a strategic `navigate_to(point)` |
