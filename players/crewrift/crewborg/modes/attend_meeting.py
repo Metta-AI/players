@@ -18,9 +18,15 @@ from players.crewrift.crewborg.strategy.meeting import (
 )
 from players.crewrift.crewborg.strategy.meeting.context import (
     CHAT_COOLDOWN_TICKS,
-    VOTE_TIMER_TICKS,
+    effective_vote_timer_ticks,
 )
-from players.crewrift.crewborg.strategy.suspicion import top_suspect
+from players.crewrift.crewborg.strategy.meeting.vote_policy import (
+    anti_split_swap,
+    deadline_posterior_gate,
+    fallback_vote,
+    should_announce,
+    skip_pileon_swap,
+)
 from players.crewrift.crewborg.types import ActionState, Belief, ChatEvent, Intent
 from players.player_sdk import Mode
 
@@ -29,7 +35,21 @@ MEETING_CHAT = "no read, skipping"
 
 LLM_MIN_CALL_INTERVAL_TICKS = 12
 DEADLINE_LLM_REMAINING_TICKS = 96
-AUTO_SUBMIT_REMAINING_TICKS = 48
+# The server's vote timer starts when the meeting OPENS — at the meeting-call
+# interstitial, ~72 ticks before our Voting phase begins — so the window we can
+# actually vote in is the configured timer minus this head start (measured on
+# crewrift 0.1.51: Voting->VoteResult 1129-1142 ticks at voteTimerTicks=1200).
+# Without this correction the deadline auto-submit fired ~12 ticks before the
+# meeting closed and 29% of votes timed out in the 2026-06-11 v2 eval.
+VOTE_TIMER_HEADSTART_TICKS = 96
+# Submit by this many (corrected) ticks remaining no matter what state we are
+# in: margin for the worst-case cursor walk (~20 edge-presses = ~40 ticks).
+AUTO_SUBMIT_REMAINING_TICKS = 120
+# With no read of our own, wait this long into the meeting before submitting:
+# long enough for confident accusers' chats + vote dots to land (they submit at
+# meeting start; a cursor walk is ~40 ticks) so the skip pile-on has a live
+# tally to read — without dragging every meeting out to the full vote timer.
+DETERMINISTIC_TALLY_WAIT_TICKS = 300
 
 # When the meeting client reports ``enabled`` but its calls keep failing (an
 # ungated/404 model, a bad API key, a network outage), we must not let that cost
@@ -60,6 +80,12 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
         self._deadline_prompted = False
         self._tentative_vote: str | None = None
         self._vote_submitted = False
+        # The vote actually submitted: latched on the first submit so (a) the
+        # vote intent stays stable across the multi-tick cursor walk and (b)
+        # ``meeting_vote_selected`` fires exactly once per meeting (it used to
+        # re-emit every Voting tick).
+        self._submitted_vote_target: str | None = None
+        self._submitted_vote_reason: str | None = None
         # Episode-level LLM health. A failing-but-"enabled" client must not
         # silently cost us our vote, so these latch the mode onto the
         # deterministic fallback and intentionally persist across meetings —
@@ -76,6 +102,20 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
             self._vote_submitted = True
             return Intent(kind="idle", reason="vote already confirmed")
 
+        # A submitted vote must keep returning the same vote intent until the
+        # action layer confirms it: an intent change mid-cursor-walk resets the
+        # walk, and an idle here would drop the vote entirely (the -10 penalty).
+        if self._vote_submitted:
+            return self._submit_vote_intent(belief, reason="continuing submitted vote")
+
+        # The deadline backstop applies to every path — LLM, deterministic, or a
+        # failing-but-enabled client — so a pending chat or an exception can never
+        # delay the vote past the timer (the no-vote penalty is -10).
+        if self._should_auto_submit(belief):
+            return self._submit_vote_intent(
+                belief, reason="meeting deadline: auto-submit tentative vote", deadline=True
+            )
+
         if not self._llm_client.enabled:
             return self._decide_deterministic(belief, trace_disabled=True)
 
@@ -83,9 +123,6 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
             # The client claims to be enabled but its calls are failing; fall
             # back to the deterministic chat->vote path so we still vote.
             return self._decide_deterministic(belief, trace_disabled=False)
-
-        if self._should_auto_submit(belief):
-            return self._submit_vote_intent(belief, reason="meeting deadline: auto-submit tentative vote")
 
         if self._pending_chat_text is not None and self._chat_cooldown_ready(belief):
             return self._send_chat_intent(belief, self._pending_chat_text, reason="sending pending LLM chat")
@@ -120,10 +157,55 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
                 "meeting_llm_fallback",
                 {"reason": "llm_disabled", "detail": self._llm_client.disabled_reason},
         )
+        vote = fallback_vote(belief)
+        announce = should_announce(belief, vote)
         if not self._deterministic_chatted:
             self._deterministic_chatted = True
-            return self._send_chat_intent(belief, MEETING_CHAT, reason="meeting opener")
-        return self._submit_vote_intent(belief, reason="deterministic meeting vote")
+            return self._send_chat_intent(
+                belief,
+                self._deterministic_chat_text(belief, vote, announce=announce),
+                reason="meeting opener",
+            )
+        # A confirmed-witness-level read (≥ ANNOUNCE_MIN_PROBABILITY or a
+        # witnessed-caught imposter): submit immediately and lead the charge —
+        # our early dot + accusation chat is what skipping crew can corroborate
+        # and pile onto. Anything below that bar votes SILENTLY after the tally
+        # window (2026-06-11 evals: led accusations ran 42% accurate vs truecrew
+        # and announcing preceded 2 of our 4 ejections vs the champion field —
+        # the lobby turns on the loudest accuser). The post-wait submit
+        # re-resolves against the live tally (anti-split + skip pile-on), so a
+        # forming credible conviction can still recruit us.
+        if announce:
+            return self._submit_vote_intent(belief, reason="deterministic meeting vote")
+        # The imposter holds its vote to the deadline auto-submit: its whole
+        # vote policy is joining the crew plurality, and at the +300 tally wait
+        # the plurality has usually not formed yet — across 87 v6-eval meetings
+        # the +300 join NEVER fired, forfeiting the free-parity ejections the
+        # same join converted 5× in 22 v3 imposter episodes. The deadline
+        # submit resolves against the meeting's final tally.
+        if belief.self_role == "imposter":
+            return Intent(kind="idle", reason="imposter: holding vote for the final tally")
+        if self._tally_wait_elapsed(belief):
+            if vote != VOTE_SKIP:
+                return self._submit_vote_intent(belief, reason="silent vote after tally wait")
+            return self._submit_vote_intent(belief, reason="deterministic vote after tally wait")
+        return Intent(kind="idle", reason="waiting for the tally before voting")
+
+    def _deterministic_chat_text(self, belief: Belief, vote: str, *, announce: bool) -> str:
+        """The opener: announce only a confirmed-witness-level read.
+
+        The accusation text is parsed by every crewborg's social layer
+        (``strategy.meeting.social``) into its accusation graph — the
+        corroboration the skip pile-on requires. It deliberately carries
+        evidence wording ("saw"), honest at this bar (a witnessed kill/vent or
+        a ≥0.9 posterior), so credibility-gated peers can follow it. Imposters
+        and crewmates below the announce bar keep the neutral opener.
+        """
+
+        del belief
+        if announce:
+            return f"saw {vote}, {vote} sus, vote {vote}"[:CHAT_MAX_CHARS]
+        return MEETING_CHAT
 
     # --- LLM call cadence -------------------------------------------------
 
@@ -270,17 +352,25 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
         self.emit.event("meeting_chat_selected", {"text": text, "reason": reason})
         return Intent(kind="chat", text=text, reason=reason)
 
-    def _submit_vote_intent(self, belief: Belief, *, reason: str) -> Intent:
-        vote_target = self._resolved_vote_target(belief)
+    def _submit_vote_intent(self, belief: Belief, *, reason: str, deadline: bool = False) -> Intent:
+        # Resolve and latch once per meeting: the same vote intent (same target,
+        # same reason) must be returned every tick of the cursor walk (an intent
+        # change resets the walk), and ``meeting_vote_selected`` fires exactly
+        # once — the same latch pattern as the ``vote_cast`` fix in events.py.
+        if self._submitted_vote_target is None:
+            self._submitted_vote_target = self._resolved_vote_target(belief, deadline=deadline)
+            self._submitted_vote_reason = reason
+            self.emit.event("meeting_vote_selected", {"target": self._submitted_vote_target, "reason": reason})
         self._vote_submitted = True
-        self.emit.event("meeting_vote_selected", {"target": vote_target, "reason": reason})
+        vote_target = self._submitted_vote_target
+        vote_reason = self._submitted_vote_reason or reason
         if vote_target == VOTE_SKIP:
-            return Intent(kind="vote", reason=reason)
-        return Intent(kind="vote", target_color=vote_target, reason=reason)
+            return Intent(kind="vote", reason=vote_reason)
+        return Intent(kind="vote", target_color=vote_target, reason=vote_reason)
 
     def _decide_after_llm_failure(self, belief: Belief, trigger: str) -> Intent:
         if trigger == "deadline":
-            return self._submit_vote_intent(belief, reason=f"LLM fallback after {trigger}")
+            return self._submit_vote_intent(belief, reason=f"LLM fallback after {trigger}", deadline=True)
         if trigger == "meeting_start":
             return self._decide_deterministic(belief, trace_disabled=False)
         return Intent(kind="idle", reason=f"LLM fallback after {trigger}")
@@ -303,6 +393,8 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
         self._deadline_prompted = False
         self._tentative_vote = None
         self._vote_submitted = False
+        self._submitted_vote_target = None
+        self._submitted_vote_reason = None
 
     def _external_chat_signature(self, belief: Belief) -> tuple[tuple[int, str | None, str], ...]:
         self_color = belief.voting.self_marker_color
@@ -321,16 +413,56 @@ class AttendMeetingMode(Mode[Belief, ActionState, Intent]):
         return self._last_chat_tick is None or belief.last_tick - self._last_chat_tick >= CHAT_COOLDOWN_TICKS
 
     def _remaining_ticks(self, belief: Belief) -> int:
-        return max(0, VOTE_TIMER_TICKS - max(0, belief.last_tick - belief.phase_start_tick))
+        # The meeting length is learned from the GAME INFO interstitial when
+        # available (currently 1200 ticks by default), with a conservative
+        # 240-tick fallback so an unknown timer can never miss the vote deadline.
+        # The server's timer started at the meeting-call interstitial, before our
+        # Voting phase clock — subtract that head start (VOTE_TIMER_HEADSTART_TICKS).
+        timer = effective_vote_timer_ticks(belief) - VOTE_TIMER_HEADSTART_TICKS
+        return max(0, timer - max(0, belief.last_tick - belief.phase_start_tick))
 
     def _should_auto_submit(self, belief: Belief) -> bool:
         return not self._vote_submitted and self._remaining_ticks(belief) <= AUTO_SUBMIT_REMAINING_TICKS
 
-    def _resolved_vote_target(self, belief: Belief) -> str:
+    def _tally_wait_elapsed(self, belief: Belief) -> bool:
+        return belief.last_tick - belief.phase_start_tick >= DETERMINISTIC_TALLY_WAIT_TICKS
+
+    def _resolved_vote_target(self, belief: Belief, *, deadline: bool = False) -> str:
         tentative = self._tentative_vote
         if tentative is not None and (tentative == VOTE_SKIP or tentative in valid_vote_targets(belief)):
-            return tentative
-        return self._fallback_vote_target(belief)
+            target = tentative
+        else:
+            target = self._fallback_vote_target(belief)
+        # Near the deadline a trailing vote is wasted (ties eject no one): join
+        # the plurality when it lands on a plausible target (design §10.2). A
+        # deterministic submit after the tally wait is final — treat it as the
+        # deadline so the swaps apply (the live tally is as formed as it gets).
+        remaining = 0 if self._tally_wait_elapsed(belief) else self._remaining_ticks(belief)
+        swapped = anti_split_swap(belief, target, remaining)
+        if swapped != target:
+            self.emit.event("meeting_anti_split_swap", {"from": target, "to": swapped})
+        # The deadline auto-submit is a backstop, not a read: a crewmate's
+        # forced vote below the posterior bar becomes a skip (wrong ejections
+        # help the imposters; design §10.2). Must-eject, confirmed imposters,
+        # and the imposter plurality-join pass through unchanged. Applied
+        # BEFORE the skip pile-on so a corroborated accusation (which has its
+        # own credibility machinery) can still recruit the gated skip — the
+        # lone-witness conviction channel survives.
+        if deadline:
+            gated = deadline_posterior_gate(belief, swapped)
+            if gated != swapped:
+                self.emit.event(
+                    "meeting_deadline_posterior_gate",
+                    {"from": swapped, "to": gated, "posterior": belief.suspicion.get(swapped, 0.0)},
+                )
+            swapped = gated
+        # A skip near the deadline joins a corroborated accusation (a voter who
+        # also chat-accused the target): the skip pile-on that lets a lone
+        # correct witness actually convict (design §10.2).
+        piled = skip_pileon_swap(belief, swapped, remaining)
+        if piled != swapped:
+            self.emit.event("meeting_skip_pileon", {"from": swapped, "to": piled})
+        return piled
 
     def _fallback_vote_target(self, belief: Belief) -> str:
-        return top_suspect(belief) or VOTE_SKIP
+        return fallback_vote(belief)

@@ -165,3 +165,181 @@ def test_vote_result_ejected_color_resolves() -> None:
     )
     resolved = resolve_scene(scene, tick=1)
     assert resolved.ejected_color == "lime"
+
+
+# --- upstream 2026-06-10 additions: tick marker, game info, meeting call, ----
+# --- game-over roles. All tolerant: absent labels resolve to None/empty. -----
+
+
+def test_server_tick_marker_resolves() -> None:
+    scene = SceneState()
+    scene.apply(
+        w.define_sprite(5016, 1, 1, "tick 4807") + w.define_object(5016, 0, 0, -32768, 0, 5016)
+    )
+    assert resolve_scene(scene, tick=1).server_tick == 4807
+
+
+def test_server_tick_marker_label_updates_each_tick() -> None:
+    scene = SceneState()
+    scene.apply(w.define_sprite(5016, 1, 1, "tick 10") + w.define_object(5016, 0, 0, 0, 0, 5016))
+    assert resolve_scene(scene, tick=1).server_tick == 10
+    # The server redefines the same sprite id with a new label every tick.
+    scene.apply(w.define_sprite(5016, 1, 1, "tick 11") + w.define_object(5016, 0, 0, 0, 0, 5016))
+    assert resolve_scene(scene, tick=2).server_tick == 11
+
+
+def test_malformed_tick_label_is_ignored() -> None:
+    scene = SceneState()
+    scene.apply(w.define_sprite(5016, 1, 1, "tick ") + w.define_object(5016, 0, 0, 0, 0, 5016))
+    assert resolve_scene(scene, tick=1).server_tick is None
+    scene.apply(w.define_sprite(5017, 1, 1, "tick 12a") + w.define_object(5017, 0, 0, 0, 0, 5017))
+    assert resolve_scene(scene, tick=2).server_tick is None
+
+
+def test_game_info_interstitial_resolves_settings() -> None:
+    scene = SceneState()
+    scene.apply(
+        w.define_sprite(9000, 40, 6, "GAME INFO")
+        + w.define_object(9000, 44, 49, 50, 0, 9000)
+        + w.define_sprite(9001, 60, 6, "KILL COOLDOWN 500T")
+        + w.define_object(9001, 34, 63, 50, 0, 9001)
+        + w.define_sprite(9002, 50, 6, "TASKS 8 EACH")
+        + w.define_object(9002, 40, 77, 50, 0, 9002)
+        + w.define_sprite(9003, 56, 6, "VOTE TIMER 1200T")
+        + w.define_object(9003, 36, 91, 50, 0, 9003)
+        + w.define_sprite(9004, 60, 6, "GAME TIMER 10000T")
+        + w.define_object(9004, 34, 105, 50, 0, 9004)
+    )
+    resolved = resolve_scene(scene, tick=1)
+    assert "GAME INFO" in resolved.phase_texts
+    info = resolved.game_info
+    assert info is not None
+    assert info.kill_cooldown_ticks == 500
+    assert info.tasks_per_player == 8
+    assert info.vote_timer_ticks == 1200
+    assert info.max_ticks == 10000
+
+
+def test_game_info_with_no_game_timer_resolves_none_max_ticks() -> None:
+    scene = SceneState()
+    scene.apply(
+        w.define_sprite(9000, 40, 6, "GAME INFO")
+        + w.define_object(9000, 44, 49, 50, 0, 9000)
+        + w.define_sprite(9001, 60, 6, "GAME TIMER NONE")
+        + w.define_object(9001, 34, 105, 50, 0, 9001)
+    )
+    info = resolve_scene(scene, tick=1).game_info
+    assert info is not None
+    assert info.max_ticks is None
+    assert info.kill_cooldown_ticks is None  # absent line ⇒ None, never a crash
+
+
+def test_game_info_absent_resolves_none() -> None:
+    scene = _scene_with_camera()
+    assert resolve_scene(scene, tick=1).game_info is None
+
+
+def test_meeting_call_report_resolves_caller_trigger_and_body() -> None:
+    scene = SceneState()
+    scene.apply(
+        # Caller icon (object 9800) + reported body icon (object 9801).
+        w.define_sprite(860, 8, 8, "player light blue right")
+        + w.define_object(9800, 29, 73, 40, 0, 860)
+        + w.define_sprite(861, 8, 8, "body green")
+        + w.define_object(9801, 79, 73, 40, 0, 861)
+        # The interstitial text lines.
+        + w.define_sprite(9000, 60, 6, "Light blue reported")
+        + w.define_object(9000, 30, 36, 50, 0, 9000)
+        + w.define_sprite(9001, 50, 6, "Green's body")
+        + w.define_object(9001, 36, 44, 50, 0, 9001)
+    )
+    resolved = resolve_scene(scene, tick=1)
+    call = resolved.meeting_call
+    assert call is not None
+    assert call.caller_color == "light blue"
+    assert call.trigger == "report"
+    assert call.body_color == "green"
+
+
+def test_meeting_call_button_resolves_trigger() -> None:
+    scene = SceneState()
+    scene.apply(
+        w.define_sprite(860, 8, 8, "player red right")
+        + w.define_object(9800, 29, 73, 40, 0, 860)
+        + w.define_sprite(5017, 12, 12, "meeting button")
+        + w.define_object(9801, 81, 75, 40, 0, 5017)
+        + w.define_sprite(9000, 40, 6, "Red pressed")
+        + w.define_object(9000, 40, 36, 50, 0, 9000)
+        + w.define_sprite(9001, 40, 6, "the button")
+        + w.define_object(9001, 42, 44, 50, 0, 9001)
+    )
+    call = resolve_scene(scene, tick=1).meeting_call
+    assert call is not None
+    assert call.caller_color == "red"
+    assert call.trigger == "button"
+    assert call.body_color is None
+
+
+def test_meeting_call_text_fallback_when_caller_left() -> None:
+    # "Someone reported" + "a body": no caller icon exists, only the text.
+    scene = SceneState()
+    scene.apply(
+        w.define_sprite(9000, 60, 6, "Someone reported")
+        + w.define_object(9000, 32, 36, 50, 0, 9000)
+        + w.define_sprite(9001, 30, 6, "a body")
+        + w.define_object(9001, 48, 44, 50, 0, 9001)
+    )
+    call = resolve_scene(scene, tick=1).meeting_call
+    assert call is not None
+    assert call.caller_color is None  # "Someone" is not a player color
+    assert call.trigger == "report"
+
+
+def test_meeting_call_text_does_not_misfire_during_voting_chat() -> None:
+    # A literal chat line ending in " reported" during Voting (vote UI + a chat
+    # icon present) must NOT read as a meeting-call interstitial.
+    scene = SceneState()
+    scene.apply(
+        w.define_sprite(9050, 60, 6, "red reported")  # chat text
+        + w.define_object(9000, 6, 30, 50, 0, 9050)
+        + w.define_sprite(9051, 8, 8, "player blue right")  # chat speaker icon
+        + w.define_object(9200, 2, 30, 50, 0, 9051)
+        + w.define_sprite(920, 4, 4, "vote timer")
+        + w.define_object(920, 1, 1, 9, 0, 920)
+    )
+    resolved = resolve_scene(scene, tick=1)
+    assert resolved.meeting_call is None
+    assert resolved.voting.active
+
+
+def test_game_over_roles_pair_icons_with_imp_crew_texts() -> None:
+    scene = SceneState()
+    scene.apply(
+        # Row 0 (left column): red is CREW. Icon at x=3,y=18; text at x=19,y=20.
+        w.define_sprite(870, 8, 8, "player red right")
+        + w.define_object(9700, 3, 18, 40, 0, 870)
+        + w.define_sprite(9001, 20, 6, "CREW")
+        + w.define_object(9001, 19, 20, 50, 0, 9001)
+        # Row 1: green is IMP. Icon at x=3,y=32; text at x=19,y=34.
+        + w.define_sprite(871, 8, 8, "player green right")
+        + w.define_object(9701, 3, 32, 40, 0, 871)
+        + w.define_sprite(9002, 16, 6, "IMP")
+        + w.define_object(9002, 19, 34, 50, 0, 9002)
+        # The outcome title.
+        + w.define_sprite(9000, 40, 6, "CREW WINS")
+        + w.define_object(9000, 40, 2, 50, 0, 9000)
+    )
+    resolved = resolve_scene(scene, tick=1)
+    assert "CREW WINS" in resolved.phase_texts
+    assert resolved.game_over_roles == {"red": "crewmate", "green": "imposter"}
+
+
+def test_new_labels_absent_resolve_to_defaults() -> None:
+    """Older servers (no tick marker / interstitials): everything stays None/empty."""
+
+    scene = _scene_with_camera()
+    resolved = resolve_scene(scene, tick=1)
+    assert resolved.server_tick is None
+    assert resolved.game_info is None
+    assert resolved.meeting_call is None
+    assert resolved.game_over_roles == {}

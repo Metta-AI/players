@@ -7,11 +7,34 @@ from typing import Any
 
 from players.crewrift.crewborg.perception.entities import SKIP_VOTE_TARGET
 from players.crewrift.crewborg.strategy.meeting.schema import CHAT_MAX_CHARS, SCHEMA_VERSION, VOTE_SKIP
-from players.crewrift.crewborg.strategy.suspicion import VOTE_PROBABILITY, _prior_imposter_p, top_suspect
+from players.crewrift.crewborg.strategy.meeting.vote_policy import (
+    alive_count,
+    anti_split_swap,
+    imposters_remaining,
+    must_eject,
+    plurality_target,
+    vote_bar,
+)
+from players.crewrift.crewborg.strategy.meeting.vote_policy import (
+    fallback_vote as _policy_fallback_vote,
+)
+from players.crewrift.crewborg.strategy.suspicion import _imposter_count, _prior_imposter_p
 from players.crewrift.crewborg.types import Belief, PlayerEvent, PlayerRecord
 
+# Conservative fallback meeting length. The live value is learned from the
+# pre-game GAME INFO interstitial (``belief.vote_timer_ticks``; the current game
+# default is 1200 = 50 s, upstream 2026-06-10). The fallback deliberately stays at
+# the OLD 240-tick default: when the timer is unknown, assuming a short meeting
+# only submits the vote early, while assuming a long one on a short-timer server
+# would miss the deadline and eat the −10 no-vote penalty.
 VOTE_TIMER_TICKS = 240
 CHAT_COOLDOWN_TICKS = 100
+
+
+def effective_vote_timer_ticks(belief: Belief) -> int:
+    """This episode's meeting length: the game-info value, else the safe fallback."""
+
+    return belief.vote_timer_ticks or VOTE_TIMER_TICKS
 
 
 def serialize_meeting_context(
@@ -25,8 +48,9 @@ def serialize_meeting_context(
     """Serialize belief into the compact, explicit context the meeting LLM sees."""
 
     sent_chat_texts = sent_chat_texts or set()
+    vote_timer_ticks = effective_vote_timer_ticks(belief)
     age_ticks = max(0, belief.last_tick - belief.phase_start_tick)
-    remaining_ticks = max(0, VOTE_TIMER_TICKS - age_ticks)
+    remaining_ticks = max(0, vote_timer_ticks - age_ticks)
     legal_targets = sorted(valid_vote_targets(belief))
     fallback_vote = _fallback_vote_target(belief)
     return {
@@ -38,7 +62,12 @@ def serialize_meeting_context(
             "tick": belief.last_tick,
             "age_ticks": age_ticks,
             "estimated_remaining_ticks": remaining_ticks,
-            "vote_timer_ticks": VOTE_TIMER_TICKS,
+            "vote_timer_ticks": vote_timer_ticks,
+            # Who opened this meeting and how (from the meeting-call interstitial;
+            # null on older servers): "report" meetings name the reported body.
+            "called_by": belief.meeting_called_by,
+            "call_trigger": belief.meeting_trigger,
+            "reported_body_color": belief.meeting_reported_body_color,
         },
         "self": {
             "color": belief.voting.self_marker_color,
@@ -63,6 +92,8 @@ def serialize_meeting_context(
         "chat": _chat_payload(belief, sent_chat_texts),
         "players": _players_payload(belief),
         "suspicion": _suspicion_payload(belief, fallback_vote),
+        "social": _social_payload(belief),
+        "game_state": _game_state_payload(belief, fallback_vote, remaining_ticks),
     }
 
 
@@ -105,12 +136,14 @@ def _excluded_vote_colors(belief: Belief) -> set[str]:
 
 
 def _fallback_vote_target(belief: Belief) -> str:
-    return top_suspect(belief) or VOTE_SKIP
+    return _policy_fallback_vote(belief)
 
 
 def _fallback_vote_reason(belief: Belief, fallback_vote: str) -> str:
+    if belief.self_role == "imposter":
+        return "join the crew plurality" if fallback_vote != VOTE_SKIP else "no crew plurality to join"
     if fallback_vote == VOTE_SKIP:
-        return f"no suspect at or above vote bar {VOTE_PROBABILITY}"
+        return f"no suspect at or above vote bar {vote_bar(belief)}"
     p = belief.suspicion.get(fallback_vote)
     return f"top suspect {fallback_vote} at P(imposter)={p:.4f}" if p is not None else "top suspect"
 
@@ -226,7 +259,7 @@ def _region_name(belief: Belief, event: PlayerEvent) -> str | None:
 def _suspicion_payload(belief: Belief, fallback_vote: str) -> dict[str, Any]:
     return {
         "prior": _rounded(_prior_imposter_p(belief)),
-        "vote_probability_threshold": VOTE_PROBABILITY,
+        "vote_probability_threshold": vote_bar(belief),
         "confirmed": sorted(belief.confirmed_imposters),
         "believed": sorted(belief.believed_imposters),
         "ranking": [
@@ -234,6 +267,56 @@ def _suspicion_payload(belief: Belief, fallback_vote: str) -> dict[str, Any]:
             for color, p in sorted(belief.suspicion.items(), key=lambda item: item[1], reverse=True)
         ],
         "would_vote": fallback_vote,
+    }
+
+
+def _social_payload(belief: Belief) -> dict[str, Any]:
+    """The who-sus'd-who record: accusation graph + prior meetings' votes."""
+
+    return {
+        "accusations": [
+            {
+                "meeting_id": accusation.meeting_id,
+                "tick": accusation.tick,
+                "speaker_color": accusation.speaker_color,
+                "target_color": accusation.target_color,
+                "stance": accusation.stance,
+                "text": accusation.text,
+            }
+            for accusation in belief.accusations
+        ],
+        "meetings": [
+            {
+                "meeting_id": record.meeting_id,
+                "votes": dict(sorted(record.votes.items())),
+                "ejected_color": record.ejected_color,
+                "ejected_was_confirmed_imposter": (
+                    record.ejected_color in belief.confirmed_imposters
+                    if record.ejected_color is not None
+                    else None
+                ),
+            }
+            for record in belief.meeting_history
+        ],
+    }
+
+
+def _game_state_payload(belief: Belief, fallback_vote: str, remaining_ticks: int) -> dict[str, Any]:
+    """Game-theory state for the vote: parity margin, endgame flags, anti-split."""
+
+    imps = imposters_remaining(belief)
+    alive = alive_count(belief)
+    plurality = plurality_target(belief)
+    anti_split = anti_split_swap(belief, fallback_vote, remaining_ticks)
+    return {
+        "alive_players": alive,
+        "imposters_total": _imposter_count(belief),
+        "imposters_remaining": imps,
+        "alive_crew": alive - imps,
+        "must_eject": must_eject(belief),
+        "vote_bar": vote_bar(belief),
+        "plurality_target": plurality,
+        "anti_split_recommendation": anti_split if anti_split != fallback_vote else None,
     }
 
 

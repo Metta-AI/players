@@ -50,6 +50,11 @@ class PretendMode(Mode[Belief, ActionState, Intent]):
         self._room_cursor: int = 0  # round-robin index over rooms
         self._task_station: ic.Point | None = None
         self._hold_until: int | None = None
+        # The room the last fake task finished in: barred from the next occupancy
+        # pick. Without this the pick often re-selects the room we are standing
+        # in (its density is high because *we* are there) and the imposter camps
+        # one station for hundreds of ticks instead of moving.
+        self._last_fake_room_name: str | None = None
 
     def decide(self, belief: Belief, action_state: ActionState) -> Intent:
         del action_state
@@ -115,10 +120,12 @@ class PretendMode(Mode[Belief, ActionState, Intent]):
             self._hold_until = belief.last_tick + TASK_TICKS
         if belief.last_tick < self._hold_until:
             return Intent(kind="idle", reason="faking a task")
-        self._state = None  # hold complete — re-dispatch
+        self._state = None  # hold complete — re-dispatch (away from this room)
         self._target_room_name = None
         self._goto_point = None
         self._room_chosen_tick = None
+        finished_room = ic.room_containing(belief, self_xy)
+        self._last_fake_room_name = finished_room.name if finished_room is not None else None
         self._dispatch(belief, self_xy)
         return self._act(belief, self_xy)
 
@@ -141,11 +148,14 @@ class PretendMode(Mode[Belief, ActionState, Intent]):
         return None  # only one room, and we are in it
 
     def _choose_occupancy_task(self, belief: Belief, self_xy: ic.Point) -> bool:
+        eligible = _fake_task_room_names(belief)
+        if self._last_fake_room_name is not None:
+            eligible = eligible - {self._last_fake_room_name}
         target = best_pretend_room_target(
             belief,
             self_xy,
             current_room_name=self._target_room_name,
-            eligible_room_names=_fake_task_room_names(belief),
+            eligible_room_names=eligible,
         )
         if target is None:
             return False

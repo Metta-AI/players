@@ -1,0 +1,14 @@
+# Keep bulky local artifacts out of player images. The build context is the
+# repo root and the crewborg Dockerfile COPYs the whole `players` tree; without
+# this file the 1.2 GB `episode_data` eval archive was baked into the image,
+# pushing pulls past Crewrift's 30 s connect window on cold k8s nodes (lobby
+# no-show -> -100 for everyone in-lobby; found during the 2026-06-11 v4/v5
+# uploads).
+**/episode_data/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+logs/
+**/*.bitreplay
+**/*.json.z
+.git/

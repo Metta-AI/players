@@ -32,6 +32,25 @@ def test_ticks_until_kill_ready() -> None:
     assert ticks_until_kill_ready(b3) == DEFAULT_KILL_COOLDOWN_TICKS - 100
 
 
+def test_ticks_until_kill_ready_prefers_game_info_config_over_default() -> None:
+    # The GAME INFO interstitial's advertised cooldown beats the compiled default…
+    b = Belief(
+        self_kill_ready=False, last_tick=100, kill_cooldown_start_tick=0, kill_cooldown_config_ticks=720
+    )
+    assert ticks_until_kill_ready(b) == 720 - 100
+    # …and applies to the no-start-observed fallback too…
+    assert ticks_until_kill_ready(Belief(self_kill_ready=False, kill_cooldown_config_ticks=720)) == 720
+    # …but a measured cooldown (watched run to ready) beats the advertised config.
+    b2 = Belief(
+        self_kill_ready=False,
+        last_tick=100,
+        kill_cooldown_start_tick=0,
+        kill_cooldown_config_ticks=720,
+        kill_cooldown_estimate=480,
+    )
+    assert ticks_until_kill_ready(b2) == 480 - 100
+
+
 def _crew(belief: Belief, object_id: int, xy: tuple[int, int], color: str, tick: int) -> None:
     belief.roster[color] = PlayerRecord(
         object_id=object_id,

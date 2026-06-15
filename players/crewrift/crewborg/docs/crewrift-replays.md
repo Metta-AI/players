@@ -1,7 +1,7 @@
 # Watching Crewrift replays locally (the correct way)
 
-**Status:** verified 2026-05-29 against crewrift game `9190fe0` / image `crewrift:0.1.23`
-and the `coworld` CLI as installed. Read this before trying to view a `.bitreplay`
+**Status:** verified 2026-06-11 against crewrift game manifest **0.1.40** / Nim **2.2.10**
+and coworld CLI **0.1.22**. Earlier verification used image `crewrift:0.1.23`.
 locally — the obvious path (`coworld replay`) is **broken for the Crewrift image**
 and will silently show you a live "waiting for players" game instead of your replay.
 
@@ -201,3 +201,65 @@ Health checks and "the map rendered" are **not** sufficient. Use one of these:
 - **It finishes.** ~N ticks ÷ 24 fps seconds of playback, then the final frame
   sticks. Reload or enable loop to rewatch.
 - **Don't set save+load together** — the server refuses to start.
+
+---
+
+## Offline replay analysis (player ↔ opponent correlation)
+
+Replays are input masks re-simulated by the Nim server — there is no Python
+`.bitreplay` decoder. Use the tools below.
+
+### 1. Download episodes
+
+```sh
+players/crewrift/crewborg/scripts/fetch_episodes.sh -n 10
+# or: coworld episodes / coworld replays (coworld ≥0.1.22)
+```
+
+Each episode directory contains `replay.json` (binary `.bitreplay`), `episode_request.json`
+(participants with slot, policy name/version, scores), and per-slot stderr logs.
+
+### 2. Expand replay to structured events (Nim)
+
+From a local `coworld-crewrift` checkout with Nim **2.2.10** (`nimby use 2.2.10`):
+
+```sh
+nim r tools/expand_replay.nim --json /path/to/replay.json
+```
+
+This runs the canonical loop:
+
+```nim
+let data = loadReplay(path)
+var sim = initSimServer(data.replayGameConfig())
+var replay = initReplayPlayer(data)
+while replay.playing:
+  replay.stepReplay(sim)
+```
+
+Output is JSON events: kills, votes, tasks, phase changes, chat — same schema as
+the `crewrift-eventlog-reporter`.
+
+### 3. Correlate crewborg vs opponents (Python)
+
+```sh
+uv run python players/crewrift/crewborg/scripts/replay_analysis.py \\
+  episode_data/20260610_abc12345 \\
+  --crewrift-root ~/coding/games/coworld-crewrift \\
+  --trace-db logs/ereq_.../trace.db
+```
+
+The script joins:
+- **Roster/scores** from `episode_request.json` (who was in the game, which policy version)
+- **Ground-truth events** from `expand_replay.nim --json`
+- **Agent behavior** from `trace.db` via `positions.server_tick` (= replay tick)
+
+Set `CREWRIFT_ROOT` if the checkout is not at the default path.
+
+### Join key: `server_tick`
+
+The game sends an invisible sprite label `tick <N>` each frame (object/sprite id 5016).
+Crewborg records this in `trace.db` `positions.server_tick`. That counter is identical
+to the `.bitreplay` timeline tick — use it to align agent mode/intent with replay events
+(kills, votes, meetings).
+

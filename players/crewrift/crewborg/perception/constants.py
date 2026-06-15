@@ -50,6 +50,15 @@ VOTE_ICON_OBJECT_BASE = 9300
 # Vote-result interstitial: a single icon for the ejected player, "player <color>
 # <facing>" (global.nim:1257-1280). Absent when the vote skipped (no one ejected).
 RESULT_ICON_OBJECT_ID = 9600
+# Game-over interstitial roster icons (global.nim ProtocolGameOverIconObjectBase):
+# one "player <color> <facing>" icon per player, paired by row with an "IMP"/"CREW"
+# text item — the end-of-game ground-truth role census by color.
+GAMEOVER_ICON_OBJECT_BASE = 9700
+# Meeting-call interstitial icons (global.nim ProtocolMeetingIconObjectBase, added
+# upstream 2026-06-10 "add meeting call interstitial"): base + 0 is the CALLER's
+# "player <color> <facing>" icon; base + 1 is either the reported "body <color>"
+# sprite (report-triggered) or the "meeting button" sprite (button-triggered).
+MEETING_ICON_OBJECT_BASE = 9800
 
 VOTE_DOT_OBJECT_BASE = 10100
 # Skip votes use a SEPARATE base and the same "vote dot <color>" sprite: object id
@@ -117,10 +126,18 @@ LABEL_GHOST_ICON = "ghost icon"
 LABEL_VOTE_CURSOR = "vote cursor"
 LABEL_VOTE_SKIP_CURSOR = "vote skip cursor"
 LABEL_VOTE_TIMER = "vote timer"
+# The meeting-call interstitial's emergency-button icon (button-triggered
+# meetings; global.nim init, upstream 2026-06-10).
+LABEL_MEETING_BUTTON = "meeting button"
 
 # Label prefixes for entity sprites (suffix carries the color / state).
 PREFIX_PROGRESS_BAR = "progress bar "  # "progress bar 45%"
 PREFIX_TASK_COUNTER = "task counter "  # "task counter 7"
+# Per-tick server tick marker (upstream 2026-06-10 "add tick log marker"): an
+# invisible 1x1 sprite (id 5016, object 5016) whose label is "tick <N>" with N =
+# the server's sim.tickCount — the same tick counter .bitreplay files use, so this
+# is the join key between crewborg's trace.db and the server replay.
+PREFIX_SERVER_TICK = "tick "
 PREFIX_VOTE_SELF_MARKER = "vote self marker "  # + color
 PREFIX_VOTE_DOT = "vote dot "  # + color
 PREFIX_PLAYER = "player "  # "player <color> left|right"
@@ -136,10 +153,15 @@ PHASE_TEXT_IMPS_REVEAL = "IMPS"
 PHASE_TEXT_CREWMATE_REVEAL = "CREWMATE"
 PHASE_TEXT_SKIP = "SKIP"
 PHASE_TEXT_NO_ONE = "NO ONE"
+PHASE_TEXT_DIED = "DIED"  # second line of the no-ejection vote result (with "NO ONE")
 PHASE_TEXT_WAS_KILLED = "WAS KILLED"
 PHASE_TEXT_DRAW = "DRAW"
 PHASE_TEXT_CREW_WINS = "CREW WINS"
 PHASE_TEXT_IMPS_WIN = "IMPS WIN"
+# Pre-game info screen title (upstream 2026-06-10 "add game info interstitial"):
+# a new GameInfo phase between the lobby countdown and role reveal, whose text
+# items expose the live game config (see the GAME_INFO_* prefixes below).
+PHASE_TEXT_GAME_INFO = "GAME INFO"
 
 # The full set of interstitial phase/result texts, for membership tests.
 PHASE_TEXTS: frozenset[str] = frozenset(
@@ -151,9 +173,39 @@ PHASE_TEXTS: frozenset[str] = frozenset(
         PHASE_TEXT_CREWMATE_REVEAL,
         PHASE_TEXT_SKIP,
         PHASE_TEXT_NO_ONE,
+        PHASE_TEXT_DIED,
         PHASE_TEXT_WAS_KILLED,
         PHASE_TEXT_DRAW,
         PHASE_TEXT_CREW_WINS,
         PHASE_TEXT_IMPS_WIN,
+        PHASE_TEXT_GAME_INFO,
     }
 )
+
+# Game-info screen settings lines (global.nim gameInfoTextLines): each is a text
+# sprite whose label encodes one live config value. "GAME TIMER NONE" appears when
+# maxTicks is 0 (no limit).
+GAME_INFO_PREFIX_KILL_COOLDOWN = "KILL COOLDOWN "  # "KILL COOLDOWN 500T"
+GAME_INFO_PREFIX_TASKS = "TASKS "  # "TASKS 8 EACH"
+GAME_INFO_PREFIX_VOTE_TIMER = "VOTE TIMER "  # "VOTE TIMER 1200T"
+GAME_INFO_PREFIX_GAME_TIMER = "GAME TIMER "  # "GAME TIMER 10000T" / "GAME TIMER NONE"
+
+# Meeting-call interstitial text lines (global.nim meetingCallLines, upstream
+# 2026-06-10): "<Color> reported" + "<Color>'s body" | "a body", or "<Color>
+# pressed" + "the button", or "<Color> called" + "a meeting". <Color> is the
+# caller's color name with the first letter capitalized ("Light blue"), or
+# "Someone" when the caller has left the game. The caller/body icons (object ids
+# MEETING_ICON_OBJECT_BASE/+1) are the authoritative signal; these texts are the
+# fallback for the icon-less "Someone" case.
+MEETING_TEXT_SUFFIX_REPORTED = " reported"
+MEETING_TEXT_SUFFIX_PRESSED = " pressed"
+MEETING_TEXT_SUFFIX_CALLED = " called"
+MEETING_TEXT_THE_BUTTON = "the button"
+MEETING_TEXT_A_MEETING = "a meeting"
+MEETING_TEXT_A_BODY = "a body"
+MEETING_TEXT_BODY_SUFFIX = "'s body"
+
+# Game-over roster role texts (global.nim interstitialTextItems GameOver branch):
+# one "IMP"/"CREW" per player, row-paired with the GAMEOVER_ICON_OBJECT_BASE icon.
+GAMEOVER_TEXT_IMP = "IMP"
+GAMEOVER_TEXT_CREW = "CREW"

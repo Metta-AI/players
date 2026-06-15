@@ -139,6 +139,55 @@ def test_search_follows_a_recently_seen_committed_target() -> None:
     assert intent.reason == "search: following last-seen target"
 
 
+def test_search_fakes_a_nearby_task_instead_of_camping_a_target_in_deep_cooldown() -> None:
+    map_data = _shadow_map()
+    nav = build_nav_graph(np.ones((120, 200), dtype=bool), map_data=map_data)
+    # Standing right next to a tasking crewmate near room A's station (80, 50),
+    # with the kill cooldown far from ready: fake the nearby station, don't camp.
+    belief = _belief(map_data, nav, (95, 80), tick=50)
+    belief.kill_cooldown_start_tick = 40
+    belief.kill_cooldown_estimate = 900  # ~890 ticks to ready >> SEARCH_LEAD_TICKS
+    _see(belief, 1001, (95, 75))  # the target, 5 px away, ~29 px off room A's station
+
+    intent = SearchMode().decide(belief, ActionState())
+    assert intent.kind == "navigate_to"
+    assert intent.reason == "search: faking a task near target"
+    assert 70 <= intent.point[0] < 90  # room A's station, within the target's sight
+
+
+def test_search_keeps_following_when_the_kill_window_is_near() -> None:
+    map_data = _shadow_map()
+    nav = build_nav_graph(np.ones((120, 200), dtype=bool), map_data=map_data)
+    belief = _belief(map_data, nav, (95, 60), tick=50)
+    belief.kill_cooldown_start_tick = 0
+    belief.kill_cooldown_estimate = 100  # ready in 50 ticks <= SEARCH_LEAD_TICKS
+    _see(belief, 1001, (90, 55))
+
+    intent = SearchMode().decide(belief, ActionState())
+    assert intent.kind == "navigate_to"
+    assert intent.point == (90, 55)
+    assert intent.reason == "search: following visible target"
+
+
+def test_search_patrols_task_stations_when_occupancy_is_empty() -> None:
+    # No occupancy substrate/snapshot at all: Search must keep moving (patrol
+    # the real task stations), never idle out a kill cooldown standing still.
+    map_data = _shadow_map()
+    nav = build_nav_graph(np.ones((120, 200), dtype=bool), map_data=map_data)
+    mode = SearchMode()
+    belief = _belief(map_data, nav, (10, 10), tick=5)
+
+    first = mode.decide(belief, ActionState())
+    assert first.kind == "navigate_to"
+    assert first.reason == "search: patrolling task stations"
+
+    # Arriving at the patrol point advances to the next station, not idle.
+    belief.self_world_x, belief.self_world_y = first.point
+    second = mode.decide(belief, ActionState())
+    assert second.kind == "navigate_to"
+    assert second.point != first.point
+
+
 def test_search_moves_through_ranked_occupancy_points() -> None:
     map_data = _shadow_map()
     nav = build_nav_graph(np.ones((120, 200), dtype=bool), map_data=map_data)
@@ -300,6 +349,37 @@ def test_pretend_starts_fake_task_on_arrival_before_retargeting() -> None:
     assert mode._state == "do_task"
     assert mode._target_room_name == "A"
     assert mode._hold_until == belief.last_tick + 72
+
+
+def test_pretend_moves_to_another_room_after_a_fake_task_completes() -> None:
+    # After the 72-tick fake-task hold, the re-dispatch must exclude the room we
+    # just faked in — re-picking it (we are standing there, so its occupancy is
+    # high) camped the imposter on one station for hundreds of ticks.
+    map_data = _shadow_map()
+    nav = build_nav_graph(np.ones((120, 200), dtype=bool), map_data=map_data)
+    belief = _belief(map_data, nav, (80, 50), tick=100)  # on room A's station
+    update_agent_tracking(belief)
+    substrate = belief.agent_tracking.substrate
+    assert substrate is not None
+    cell_a = next(cell for cell in substrate.cells.values() if cell.label == "A")
+    belief.agent_tracking.snapshot = OccupancySnapshot(
+        tick=100,
+        expected_by_cell={cell_a.index: 2.0},  # room A still ranks hottest
+        top_cell=cell_a.index,
+        top_point=cell_a.center,
+        top_expected=2.0,
+        tracked_count=1,
+        support_cell_count=1,
+    )
+
+    mode = PretendMode()
+    mode._state = "do_task"
+    mode._task_station = (80, 50)
+    mode._hold_until = belief.last_tick  # the hold just expired
+
+    intent = mode.decide(belief, ActionState())
+    assert intent.kind == "navigate_to"
+    assert not (70 <= intent.point[0] < 90)  # NOT room A's station again
 
 
 def test_pretend_does_not_fake_a_task_in_the_starting_room() -> None:

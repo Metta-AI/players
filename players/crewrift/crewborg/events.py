@@ -58,6 +58,7 @@ or ``CREWBORG_TRACE_INCLUDE``; the stderr sink applies the matching output filte
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Any
@@ -66,11 +67,9 @@ from players.crewrift.crewborg.action import BTN_A, BTN_B
 from players.crewrift.crewborg.perception.constants import SCREEN_HEIGHT, SCREEN_WIDTH
 from players.crewrift.crewborg.strategy.opportunity import has_trackable_victim, kill_urgency_ticks
 from players.crewrift.crewborg.strategy.rule_based import FLEE_ENTER_SQ, FLEE_EXIT_SQ, FLEE_STALE_TICKS
-from players.crewrift.crewborg.strategy.suspicion import (
-    VOTE_PROBABILITY,
-    _prior_imposter_p,
-    top_suspect,
-)
+from players.crewrift.crewborg.strategy.meeting.schema import VOTE_SKIP
+from players.crewrift.crewborg.strategy.meeting.vote_policy import fallback_vote, vote_bar
+from players.crewrift.crewborg.strategy.suspicion import _prior_imposter_p
 from players.crewrift.crewborg.trace import TraceConfig
 from players.crewrift.crewborg.types import ActionState, Belief, Command, Intent, PlayerRecord
 from players.player_sdk import EventEmitter, StepContext
@@ -88,7 +87,13 @@ class CrewborgEventTracer:
         debug: bool | None = None,
         viewer: bool | None = None,
         trace_config: TraceConfig | None = None,
+        episode_recorder: Any | None = None,
     ) -> None:
+        # Optional artifact recorder (duck-typed ``SqliteEpisodeRecorder``): when
+        # present, the tracer streams one per-tick row into the artifact's
+        # ``positions`` table and pushes episode metadata (role / outcome) into
+        # ``summary.json``. Best-effort: the recorder is never required.
+        self._episode_recorder = episode_recorder
         # Previous-tick state for edge/delta detection. ``phase`` starts at the
         # Belief default so the first real transition (unknown → …) is reported.
         self._phase: str = "unknown"
@@ -97,7 +102,19 @@ class CrewborgEventTracer:
         self._completed_task_indices: set[int] = set()
         self._last_kill_tick: int | None = None
         self._vote_confirmed: bool = False
+        self._vote_cast_meeting_id: int | None = None  # one vote_cast per meeting
         self._started_task_index: int | None = None
+        # Last known self world fix (belief's own copy goes None during meetings,
+        # when the camera is torn down): the spatial annotation for every domain
+        # event + the meeting-call/kill geometry payloads.
+        self._self_x: int | None = None
+        self._self_y: int | None = None
+        self._room_id: int | None = None
+        # The most recent kill attempt's geometry, folded into kill_landed.
+        self._last_kill_attempt: dict[str, Any] | None = None
+        self._meeting_call_id: int | None = None  # one meeting_called per meeting
+        self._game_over_emitted: bool = False
+        self._episode_color: str | None = None
 
         # Knowledge-layer delta state (per color where noted).
         self._event_counts: dict[str, int] = {}  # color → events logged so far (emit the new tail)
@@ -128,15 +145,22 @@ class CrewborgEventTracer:
 
     def __call__(self, context: StepContext[Belief, ActionState, Intent, Command]) -> None:
         belief = context.belief
-        emit = context.emit
+        self._update_self_fix(belief)
+        # Every domain event is spatially annotated (self_x / self_y / room_id)
+        # via this wrapper, so analysis can place any event on the map without
+        # joining against the positions table.
+        emit = _SpatialEmitter(context.emit, self._self_x, self._self_y, self._room_id)
         self._observe_phase(belief, emit)
         self._observe_role(belief, emit)
         self._observe_bodies(belief, emit)
         self._observe_completed_tasks(belief, emit)
         self._observe_kill_landed(belief, emit)
-        self._observe_vote(context.action_state, emit)
-        self._observe_action(context.intent, context.command, emit)
+        self._observe_vote(belief, context.action_state, emit)
+        self._observe_action(belief, context.intent, context.command, emit)
+        self._observe_meeting_called(belief, emit)
+        self._observe_game_over(belief, emit)
         self._observe_chat_received(belief, emit)
+        self._record_position(context)
         if self._emit_decision_snapshot:
             self._observe_decision_snapshot(context)
         # Knowledge layer: the event log + suspicion reasoning behind the actions.
@@ -170,6 +194,10 @@ class CrewborgEventTracer:
         if self._role is None and belief.self_role is not None:
             self._role = belief.self_role
             emit.event("role_resolved", {"role": belief.self_role})
+            self._set_episode_info(role=belief.self_role)
+        if self._episode_color is None and belief.voting.self_marker_color is not None:
+            self._episode_color = belief.voting.self_marker_color
+            self._set_episode_info(color=self._episode_color)
 
     def _observe_bodies(self, belief: Belief, emit: EventEmitter) -> None:
         for body_id in sorted(belief.bodies.keys() - self._seen_body_ids):
@@ -192,20 +220,43 @@ class CrewborgEventTracer:
         # update_belief records when our own kill lands (imposter only).
         if belief.last_kill_tick is not None and belief.last_kill_tick != self._last_kill_tick:
             self._last_kill_tick = belief.last_kill_tick
-            emit.event("kill_landed", {"world_x": belief.self_world_x, "world_y": belief.self_world_y})
+            payload: dict[str, Any] = {
+                "world_x": belief.self_world_x,
+                "world_y": belief.self_world_y,
+            }
+            # Fold in the geometry captured at the most recent kill attempt (the A
+            # press that landed this kill): victim identity/position, the strike
+            # distance, how long the kill had been ready, and witnesses in LOS.
+            if self._last_kill_attempt is not None:
+                payload.update(self._last_kill_attempt)
+            emit.event("kill_landed", payload)
             emit.counter("kill_landed")
 
-    def _observe_vote(self, action_state: ActionState, emit: EventEmitter) -> None:
-        # vote_confirmed flips False→True the tick the vote is cast, and the action
-        # layer resets it when the intent changes — so this fires once per meeting.
-        if action_state.vote_confirmed and not self._vote_confirmed:
-            emit.event("vote_cast", {})
+    def _observe_vote(self, belief: Belief, action_state: ActionState, emit: EventEmitter) -> None:
+        # vote_confirmed flips False→True the tick the vote is cast. The action
+        # layer resets it whenever the intent changes — and meeting modes cycle
+        # vote→idle→vote intents — so a raw edge detector fires dozens of times
+        # per meeting. A vote is final once cast (the server ignores re-presses),
+        # so latch on the meeting id and report exactly one cast per meeting.
+        meeting_id = belief.phase_start_tick if belief.phase == "Voting" else None
+        if meeting_id is None:
+            self._vote_confirmed = action_state.vote_confirmed
+            return
+        if (
+            action_state.vote_confirmed
+            and not self._vote_confirmed
+            and self._vote_cast_meeting_id != meeting_id
+        ):
+            self._vote_cast_meeting_id = meeting_id
+            emit.event("vote_cast", {"meeting_id": meeting_id})
             emit.counter("vote_cast")
         self._vote_confirmed = action_state.vote_confirmed
 
     # --- attempt events (intent + the wire command it produced) -------------
 
-    def _observe_action(self, intent: Intent, command: Command, emit: EventEmitter) -> None:
+    def _observe_action(
+        self, belief: Belief, intent: Intent, command: Command, emit: EventEmitter
+    ) -> None:
         kind = intent.kind
 
         # task_started fires when we commit to a new task, and again if we resume
@@ -223,7 +274,12 @@ class CrewborgEventTracer:
             emit.event("chat_sent", {"text": command.chat})
             emit.counter("chat_sent")
         elif kind == "kill" and command.held_mask & BTN_A:
-            emit.event("kill_attempted", {"target_id": intent.target_id})
+            # Kill intents target by color (the roster key); the object id is
+            # resolved from the roster. Geometry is captured here — at the actual
+            # strike press — and reused to enrich the kill_landed outcome.
+            payload = self._kill_attempt_payload(belief, intent)
+            self._last_kill_attempt = dict(payload)
+            emit.event("kill_attempted", payload)
             emit.counter("kill_attempted")
         elif kind == "report" and command.held_mask & BTN_A:
             emit.event("report_attempted", {"body_id": intent.target_id})
@@ -233,6 +289,121 @@ class CrewborgEventTracer:
             # vent use just like the dedicated ``vent`` intent.
             emit.event("vent_attempted", {})
             emit.counter("vent_attempted")
+
+    def _kill_attempt_payload(self, belief: Belief, intent: Intent) -> dict[str, Any]:
+        """The strike's geometry: victim fix, distance, readiness age, witnesses."""
+
+        victim = belief.roster.get(intent.target_color) if intent.target_color is not None else None
+        victim_xy = (victim.world_x, victim.world_y) if victim is not None else None
+        self_xy = _belief_self_xy(belief)
+        return {
+            "target_color": intent.target_color,
+            "target_id": victim.object_id if victim is not None else intent.target_id,
+            "victim_x": victim_xy[0] if victim_xy is not None else None,
+            "victim_y": victim_xy[1] if victim_xy is not None else None,
+            "dist": _rounded_dist(_dist_sq(self_xy, victim_xy)),
+            "ticks_since_ready": kill_urgency_ticks(belief),
+            "witnesses": _witnesses_in_los(belief, intent.target_color, victim_xy),
+        }
+
+    def _observe_meeting_called(self, belief: Belief, emit: EventEmitter) -> None:
+        """Emit who opened each meeting (and how), once per meeting.
+
+        Sourced from the meeting-call interstitial (upstream 2026-06-10): the
+        caller's identity and the report/button trigger were previously
+        unobservable. The spatial annotation carries our last Playing-phase
+        position, i.e. where we were when the meeting interrupted us.
+        """
+
+        if belief.phase != "MeetingCall":
+            return
+        if belief.phase_start_tick == self._meeting_call_id:
+            return
+        self._meeting_call_id = belief.phase_start_tick
+        emit.event(
+            "meeting_called",
+            {
+                "by": belief.meeting_called_by,
+                "trigger": belief.meeting_trigger,
+                "body_color": belief.meeting_reported_body_color,
+            },
+        )
+        emit.counter("meeting_called", tags={"trigger": belief.meeting_trigger or "unknown"})
+
+    def _observe_game_over(self, belief: Belief, emit: EventEmitter) -> None:
+        """Emit the episode outcome once, when the GameOver screen names it.
+
+        ``alive_by_color`` is the roster's final alive/dead view; ``roles`` is the
+        end-of-game ground-truth role census paired off the GameOver screen
+        (color → imposter/crewmate), when the server provides it.
+        """
+
+        if self._game_over_emitted or belief.game_outcome is None:
+            return
+        self._game_over_emitted = True
+        emit.event(
+            "game_over",
+            {
+                "outcome": belief.game_outcome,
+                "alive_by_color": {
+                    color: record.life_status != "dead"
+                    for color, record in sorted(belief.roster.items())
+                },
+                "roles": dict(sorted(belief.game_over_roles.items())),
+            },
+        )
+        emit.counter("game_over", tags={"outcome": belief.game_outcome})
+        self._set_episode_info(outcome=belief.game_outcome)
+
+    def _update_self_fix(self, belief: Belief) -> None:
+        """Track the last known self position + room (belief's copy goes None
+        whenever the camera is down, e.g. during meetings)."""
+
+        if belief.self_world_x is None or belief.self_world_y is None:
+            return
+        self._self_x = belief.self_world_x
+        self._self_y = belief.self_world_y
+        self._room_id = _room_index(belief, self._self_x, self._self_y)
+
+    def _set_episode_info(self, **fields: Any) -> None:
+        recorder = self._episode_recorder
+        if recorder is None:
+            return
+        set_info = getattr(recorder, "set_episode_info", None)
+        if set_info is not None:
+            set_info(**fields)
+
+    def _record_position(self, context: StepContext[Belief, ActionState, Intent, Command]) -> None:
+        """Stream one per-tick row into the artifact's ``positions`` table.
+
+        The compact ``visible`` column is this tick's seen players from the
+        perception tape (empty when the camera is down, e.g. meetings).
+        """
+
+        recorder = self._episode_recorder
+        if recorder is None:
+            return
+        record_position = getattr(recorder, "record_position", None)
+        if record_position is None:
+            return
+        belief = context.belief
+        frame = belief.recent_frames[-1] if belief.recent_frames else None
+        if frame is not None and frame.tick == belief.last_tick:
+            visible = [{"c": c, "x": p[0], "y": p[1]} for c, p in sorted(frame.players.items())]
+        else:
+            visible = []
+        record_position(
+            tick=context.tick,
+            server_tick=belief.server_tick,
+            self_x=belief.self_world_x,
+            self_y=belief.self_world_y,
+            room_id=self._room_id if belief.self_world_x is not None else None,
+            mode=context.active_mode_name,
+            intent_kind=context.intent.kind,
+            held_mask=context.command.held_mask,
+            phase=belief.phase,
+            visible=json.dumps(visible, separators=(",", ":")),
+        )
 
     def _observe_chat_received(self, belief: Belief, emit: EventEmitter) -> None:
         """Emit each newly heard meeting chat line once per meeting."""
@@ -341,8 +512,9 @@ class CrewborgEventTracer:
         """Snapshot the full suspicion picture once at the start of each meeting.
 
         The ranked posteriors, each suspect's event log, and the would-be vote
-        (``top_suspect`` against the same vote bar Attend Meeting uses) — the one
-        record that explains a meeting's vote after the fact.
+        (``fallback_vote`` against the same state-dependent vote bar Attend
+        Meeting uses) — the one record that explains a meeting's vote after the
+        fact.
         """
 
         if belief.phase != "Voting":
@@ -354,7 +526,8 @@ class CrewborgEventTracer:
         # Suspicion is crewmate-only (cleared for imposter/ghost), so nothing to show otherwise.
         if not belief.suspicion:
             return
-        target = top_suspect(belief)
+        fallback = fallback_vote(belief)
+        target = fallback if fallback != VOTE_SKIP else None
         ranking = [
             {
                 "color": color,
@@ -372,8 +545,12 @@ class CrewborgEventTracer:
                 "confirmed": sorted(belief.confirmed_imposters),
                 "believed": sorted(belief.believed_imposters),
                 "would_vote": target,
-                "would_vote_p": round(belief.suspicion[target], 4) if target is not None else None,
-                "vote_bar": VOTE_PROBABILITY,
+                "would_vote_p": (
+                    round(belief.suspicion[target], 4)
+                    if target is not None and target in belief.suspicion
+                    else None
+                ),
+                "vote_bar": vote_bar(belief),
             },
         )
 
@@ -545,6 +722,74 @@ class CrewborgEventTracer:
             )
 
         emit.event("viewer_frame", _viewer_frame_payload(context))
+
+
+class _SpatialEmitter:
+    """EventEmitter wrapper that spatially annotates every domain event payload.
+
+    Adds ``self_x`` / ``self_y`` / ``room_id`` (the tracer's last known self fix —
+    kept through meetings, when belief's live copy is None) to each ``event``
+    payload without overwriting fields the event already carries. Counters /
+    gauges / histograms pass through untouched.
+    """
+
+    def __init__(self, inner: EventEmitter, self_x: int | None, self_y: int | None, room_id: int | None) -> None:
+        self._inner = inner
+        self._fields = {"self_x": self_x, "self_y": self_y, "room_id": room_id}
+
+    def event(self, name: str, data: dict[str, Any] | None = None) -> None:
+        payload = dict(data or {})
+        for key, value in self._fields.items():
+            payload.setdefault(key, value)
+        self._inner.event(name, payload)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _room_index(belief: Belief, x: int, y: int) -> int | None:
+    """The baked-map room index containing ``(x, y)``, or ``None``."""
+
+    if belief.map is None:
+        return None
+    for index, room in enumerate(belief.map.rooms):
+        if room.x <= x < room.x + room.w and room.y <= y < room.y + room.h:
+            return index
+    return None
+
+
+# Another player this close to the victim (world px) is considered able to see a
+# kill — matches the imposter's own zero-urgency isolation radius (opportunity.py).
+WITNESS_LOS_RADIUS_SQ = 48**2
+
+
+def _witnesses_in_los(
+    belief: Belief, victim_color: str | None, victim_xy: tuple[int, int] | None
+) -> list[dict[str, Any]]:
+    """Players visible in our LOS this tick, with their distance to the victim.
+
+    Sourced from the latest perception-tape frame (players are only rendered in
+    line of sight, so presence in the frame implies LOS). ``near`` flags the ones
+    within witness range of the victim.
+    """
+
+    frame = belief.recent_frames[-1] if belief.recent_frames else None
+    if frame is None or frame.tick != belief.last_tick:
+        return []
+    witnesses: list[dict[str, Any]] = []
+    for color, (x, y) in sorted(frame.players.items()):
+        if color == victim_color:
+            continue
+        dist_sq = _dist_sq((x, y), victim_xy)
+        witnesses.append(
+            {
+                "color": color,
+                "dist": _rounded_dist(dist_sq),
+                "near": dist_sq is not None and dist_sq <= WITNESS_LOS_RADIUS_SQ,
+                "teammate": color in belief.teammate_colors,
+            }
+        )
+    return witnesses
 
 
 def _kill_state(belief: Belief) -> dict[str, object]:

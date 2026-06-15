@@ -23,10 +23,17 @@ attends meetings, reports bodies, flees believed imposters, and **votes out the
 most-likely imposter**; as a crewmate ghost it keeps finishing tasks with
 wall-ignoring navigation and skips body reports / imposter avoidance. A
 **Bayesian suspicion model** (`strategy/suspicion.py`) maintains a
-posterior `P(imposter)` per player (a combinatorial prior updated by likelihood
-ratios for witnessed kills/vents and graded event-log cues); it flees anyone over a
-probability threshold and at meetings votes the highest-`P` player above the vote
-bar (else skips), with reporting a visible body taking priority over fleeing. As an
+posterior `P(imposter)` per player (a remaining-imposter-budget prior updated by
+likelihood ratios for witnessed kills/vents, graded event-log cues, and social
+who-sus'd-who cues parsed from meeting chat); it flees anyone over a probability
+threshold, and at meetings a **game-theory vote policy**
+(`strategy/meeting/vote_policy.py`) votes the highest-`P` player above a
+state-dependent bar (zero in a must-eject endgame, tighter as the crew nears
+parity), swaps a trailing vote onto the plurality near the deadline to avoid
+splits, and — as an imposter — joins the crew plurality on a non-teammate. A vote
+(player or skip) is always cast before the timer: a deadline auto-submit plus an
+action-layer last-resort confirm guarantee it. Reporting a visible body takes
+priority over fleeing. As an
 imposter the
 role-aware selector runs a priority order during `Playing`: **Evade** immediately
 after its own kill (vent if possible, else move away from the body), **Report Body**
@@ -59,7 +66,8 @@ crewborg/
   types.py           the six SDK types + perceive/update_belief + phase machine
   action.py          action layer: stateful resolve_action + movement/edge FSMs
   nav.py             baked nav graph: pixel-validated A* + reachability + anchors + vent-teleport routing
-  trace.py           stderr-JSON trace & metrics sinks
+  trace.py           trace & metrics sinks: tee fan-out + opt-in stderr-JSON streaming
+  artifact.py        SQLite episode recorder + end-of-episode debug artifact upload
   events.py          CrewborgEventTracer: on_step_complete hook → domain.* events
   modes/             idle/normal/crewmate_ghost/dick_mode/attend_meeting/report_body/flee + evade/pretend/search/hunt (+ imposter_common helpers)
   strategy/          rule_based.py: mode selector + suspicion.py: Bayesian P(imposter) → believed_imposters + event_log.py: per-player observation log + occupancy.py: perception-tape predicates + opportunity.py: victim/witness logic + trajectory.py: intercept prediction
@@ -106,17 +114,39 @@ button-walk budget plus a 10-tick buffer, the bot calls a meeting, sends
 resumes tasking. Crewrift's default config allows one emergency button call per
 player, so the strategy intentionally treats this as a one-shot interruption.
 
-Crewborg traces its reasoning to stderr as JSON lines. The hosted default is
-lean enough for capped Coworld logs: durable domain events, action attempts,
-meeting chat/vote decisions, per-player event deltas, occupancy seek changes,
-and a ranked `suspicion_snapshot` at every meeting (see `design.md` §11).
-Per-tick SDK traces, metrics, `decision_snapshot`, viewer frames, suspicion
-ticks, kill-state dumps, and occupancy snapshots are off by default. Set
-`CREWBORG_METRICS=1` to include metrics, `CREWBORG_TRACE=viewer` for the
-per-tick replay view model consumed by the browser UI, or `CREWBORG_TRACE=debug`
-for the full framework trace plus viewer frames and heavier suspicion / kill /
-occupancy debug dump. Set `CREWBORG_LLM_TRACE_RAW=1` (or
-`CREWBORG_TRACE=debug`) to include raw LLM request/response text.
+## Logging & the episode artifact
+
+Crewborg records its full, unfiltered trace/metric stream into an in-memory
+SQLite database (`artifact.py`) instead of streaming JSON to stderr. At episode
+end the bridge zips `trace.db` + `summary.json` and uploads them to the per-slot
+`COWORLD_PLAYER_ARTIFACT_UPLOAD_URL` the Coworld runner injects (presigned
+`https://` PUT hosted, `file://` path on local runs; absent ⇒ skipped). The
+upload is best-effort: a missing or failed artifact never fails the episode.
+Inspect an artifact with any sqlite client:
+
+```sh
+unzip crewborg.zip && sqlite3 trace.db \
+  'SELECT tick, event, data FROM traces WHERE event = "domain.vote_cast"'
+```
+
+Tables: `traces(seq, wall_time, tick, event, data)` and
+`metrics(seq, wall_time, kind, name, value, tags)` — `data`/`tags` are JSON text
+(use SQLite's `json_extract`). `summary.json` carries per-event counts, the tick
+range, and dropped-row counts (rows are capped to bound memory).
+
+Stderr JSON streaming remains available for local debugging but is now opt-in:
+setting any `CREWBORG_TRACE*` env enables it (in addition to the artifact).
+The lean stderr stream (durable domain events, action attempts, meeting
+chat/vote decisions, per-player event deltas, occupancy seek changes, and a
+ranked `suspicion_snapshot` at every meeting — see `design.md` §11) comes back
+with e.g. `CREWBORG_TRACE_GROUPS=lean`. Per-tick `decision_snapshot`, viewer
+frames, suspicion ticks, kill-state dumps, and occupancy snapshots are still
+only *generated* at the debug levels: set `CREWBORG_METRICS=1` to include
+metrics on stderr, `CREWBORG_TRACE=viewer` for the per-tick replay view model
+consumed by the browser UI, or `CREWBORG_TRACE=debug` for the full framework
+trace plus viewer frames and heavier suspicion / kill / occupancy debug dump.
+Set `CREWBORG_LLM_TRACE_RAW=1` (or `CREWBORG_TRACE=debug`) to include raw LLM
+request/response text.
 
 For targeted traces without full debug volume, set `CREWBORG_TRACE_GROUPS` to a
 comma-separated list. Useful groups include `voting`/`meeting`, `action`,

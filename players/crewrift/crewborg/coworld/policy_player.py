@@ -9,10 +9,18 @@ Each incoming binary message is decoded into the ``SceneState`` and drives one
 ``runtime.step``; the held button mask is sent only when it changes, and meeting
 chat is sent during Voting.
 
+Logging: the full unfiltered trace/metric stream is recorded into an in-memory
+SQLite database and uploaded as the player debug artifact at episode end
+(:mod:`players.crewrift.crewborg.artifact`) instead of being streamed to stderr.
+The stderr JSON sinks remain available for local debugging when ``CREWBORG_TRACE``
+(or the trace group/include envs) is set explicitly.
+
 Environment:
 
 - ``COGAMES_ENGINE_WS_URL`` — websocket URL including ``?slot=…&token=…``
   (the runner fills these in; token validation is at HTTP upgrade).
+- ``COWORLD_PLAYER_ARTIFACT_UPLOAD_URL`` — optional per-slot artifact upload URL
+  (presigned ``https://`` PUT, or ``file://`` on local runs). Absent ⇒ no upload.
 """
 
 from __future__ import annotations
@@ -28,9 +36,20 @@ from websockets.exceptions import ConnectionClosed
 
 from players.crewrift.crewborg import build_runtime
 from players.crewrift.crewborg.action import encode_chat, encode_input
+from players.crewrift.crewborg.artifact import (
+    SqliteEpisodeRecorder,
+    episode_info_from_ws_url,
+    upload_episode_artifact,
+)
 from players.crewrift.crewborg.coworld.scene import SceneState
 from players.crewrift.crewborg.map import walkability_matches
-from players.crewrift.crewborg.trace import StderrJsonMetricsSink, StderrJsonTraceSink
+from players.crewrift.crewborg.trace import (
+    StderrJsonMetricsSink,
+    StderrJsonTraceSink,
+    TeeMetricsSink,
+    TeeTraceSink,
+    TraceConfig,
+)
 from players.crewrift.crewborg.types import Observation
 
 METRICS_ENV = "CREWBORG_METRICS"
@@ -45,9 +64,31 @@ async def run_bridge(
     """Connect, run the per-tick loop, and return when the socket closes."""
 
     scene = SceneState()
+    # All traces/metrics land in the SQLite episode recorder (uploaded as the
+    # player artifact at episode end). Stderr JSON streaming is opt-in via the
+    # CREWBORG_TRACE* / CREWBORG_METRICS envs for local debugging.
+    recorder = SqliteEpisodeRecorder()
+    # Populate best-effort, non-secret episode metadata (currently the player slot,
+    # parsed from the connect URL; the auth token is dropped, never stored). Wrapped
+    # so a missing/odd URL never fails the episode. Richer fields (resolved role,
+    # game outcome) can be pushed later via recorder.set_episode_info(...) once the
+    # event/belief layer holds them — the hook and summary plumbing are in place.
+    try:
+        recorder.set_episode_info(**episode_info_from_ws_url(engine_ws_url))
+    except Exception as error:  # noqa: BLE001 — metadata is best-effort, never fatal.
+        print(f"crewborg artifact: episode-info capture skipped: {error!r}", file=sys.stderr, flush=True)
     runtime = build(
-        trace_sink=StderrJsonTraceSink.from_env(),
-        metrics_sink=StderrJsonMetricsSink() if _metrics_enabled() else None,
+        trace_sink=TeeTraceSink(
+            recorder,
+            StderrJsonTraceSink.from_env() if _stderr_trace_enabled() else None,
+        ),
+        metrics_sink=TeeMetricsSink(
+            recorder,
+            StderrJsonMetricsSink() if _metrics_enabled() else None,
+        ),
+        # Lets the event tracer stream the per-tick positions table into the
+        # artifact and push role/color/outcome into summary.json.
+        episode_recorder=recorder,
     )
     last_sent_mask: int | None = None
     walkability_checked = False
@@ -106,6 +147,11 @@ async def run_bridge(
                 print("game over: server closed the connection", file=sys.stderr, flush=True)
     finally:
         runtime.close()
+        # Upload before the container is torn down. Best-effort: a missing URL
+        # or failed upload never fails the episode (upload_episode_artifact
+        # swallows and logs all errors).
+        upload_episode_artifact(recorder)
+        recorder.close()
 
 
 def main() -> None:
@@ -117,6 +163,13 @@ def _metrics_enabled() -> bool:
     trace_level = os.environ.get("CREWBORG_TRACE", "").strip().lower()
     metrics_flag = os.environ.get(METRICS_ENV, "").strip().lower()
     return trace_level == "debug" or metrics_flag in {"1", "true", "yes", "on"}
+
+
+def _stderr_trace_enabled() -> bool:
+    """Stderr JSON trace streaming is opt-in: any explicit trace targeting enables it."""
+
+    config = TraceConfig.from_env()
+    return bool(config.level) or config.has_targets
 
 
 if __name__ == "__main__":

@@ -285,3 +285,133 @@ def test_chat_log_accumulates_dedups_and_resets_each_meeting() -> None:
     _fold(belief, 10, crew_tasks_remaining=3)
     _fold(belief, 11, voting=voting, chat_lines=(ChatLine(speaker_color="green", text="fresh"),))
     assert [(e.speaker_color, e.text) for e in belief.chat_log] == [("green", "fresh")]
+
+
+# --- upstream 2026-06-10: GameInfo / MeetingCall phases, tick marker, ---------
+# --- game config, meeting attribution, game outcome. --------------------------
+
+
+def _fold_interstitial(belief: Belief, tick: int, **resolved_fields) -> None:
+    """Fold a camera-down frame (interstitials tear the map object down)."""
+
+    resolved = ResolvedScene(tick=tick, camera_ready=False, camera_x=0, camera_y=0, **resolved_fields)
+    update_belief(belief, Percept(tick=tick, messages_applied=tick, resolved=resolved))
+
+
+def test_game_info_phase_and_config_learning() -> None:
+    from players.crewrift.crewborg.perception.entities import GameInfo
+
+    belief = Belief()
+    _fold_interstitial(
+        belief,
+        1,
+        phase_texts=frozenset({"GAME INFO"}),
+        game_info=GameInfo(
+            kill_cooldown_ticks=500, tasks_per_player=8, vote_timer_ticks=1200, max_ticks=10000
+        ),
+    )
+    assert belief.phase == "GameInfo"
+    assert belief.kill_cooldown_config_ticks == 500
+    assert belief.tasks_per_player == 8
+    assert belief.vote_timer_ticks == 1200
+    assert belief.game_max_ticks == 10000
+
+    # GameInfo → RoleReveal → Playing proceeds as before.
+    _fold_interstitial(belief, 73, phase_texts=frozenset({"CREWMATE"}))
+    assert belief.phase == "RoleReveal"
+    _fold(belief, 120, crew_tasks_remaining=5)
+    assert belief.phase == "Playing"
+
+
+def test_game_info_to_playing_when_role_reveal_disabled() -> None:
+    from players.crewrift.crewborg.perception.entities import GameInfo
+
+    belief = Belief()
+    _fold_interstitial(belief, 1, phase_texts=frozenset({"GAME INFO"}), game_info=GameInfo())
+    assert belief.phase == "GameInfo"
+    # roleRevealTicks=0 servers jump straight to Playing: a live camera frame.
+    _fold(belief, 73)
+    assert belief.phase == "Playing"
+
+
+def test_meeting_call_pins_phase_and_latches_attribution() -> None:
+    from players.crewrift.crewborg.perception.entities import MeetingCall, VotingState
+
+    belief = Belief()
+    _fold(belief, 1, crew_tasks_remaining=5)
+    assert belief.phase == "Playing"
+
+    call = MeetingCall(caller_color="red", trigger="report", body_color="green")
+    _fold_interstitial(belief, 10, meeting_call=call)
+    assert belief.phase == "MeetingCall"
+    assert belief.phase_start_tick == 10
+    assert belief.meeting_called_by == "red"
+    assert belief.meeting_trigger == "report"
+    assert belief.meeting_reported_body_color == "green"
+    # The named body is a death we now know about, even unseen in-world.
+    assert belief.roster["green"].life_status == "dead"
+    assert belief.roster["green"].death_source == "report"
+
+    # The interstitial holds for ~72 ticks, then Voting opens; the attribution
+    # persists through the meeting and lands on the meeting record.
+    _fold_interstitial(belief, 82, voting=VotingState(timer_present=True))
+    assert belief.phase == "Voting"
+    assert belief.meeting_called_by == "red"
+    assert belief.meeting_history[-1].called_by == "red"
+    assert belief.meeting_history[-1].trigger == "report"
+    assert belief.meeting_history[-1].reported_body_color == "green"
+
+    # A later meeting resets the latch before refilling it.
+    _fold(belief, 200, crew_tasks_remaining=4)
+    assert belief.phase == "Playing"
+    _fold_interstitial(belief, 300, meeting_call=MeetingCall(caller_color="blue", trigger="button"))
+    assert belief.meeting_called_by == "blue"
+    assert belief.meeting_trigger == "button"
+    assert belief.meeting_reported_body_color is None
+
+
+def test_meeting_call_with_unknown_caller_keeps_none() -> None:
+    from players.crewrift.crewborg.perception.entities import MeetingCall
+
+    belief = Belief()
+    _fold(belief, 1, crew_tasks_remaining=5)
+    _fold_interstitial(belief, 10, meeting_call=MeetingCall(trigger="report"))
+    assert belief.phase == "MeetingCall"
+    assert belief.meeting_called_by is None
+    assert belief.meeting_trigger == "report"
+
+
+def test_server_tick_folds_into_belief() -> None:
+    belief = Belief()
+    _fold(belief, 1, server_tick=4807)
+    assert belief.server_tick == 4807
+    # Absent marker (older server / dropped frame) keeps the last value.
+    _fold(belief, 2)
+    assert belief.server_tick == 4807
+
+
+def test_game_over_outcome_and_roles_fold() -> None:
+    belief = Belief()
+    _fold_interstitial(
+        belief,
+        500,
+        phase_texts=frozenset({"CREW WINS"}),
+        game_over_roles={"red": "crewmate", "green": "imposter"},
+    )
+    assert belief.phase == "GameOver"
+    assert belief.game_outcome == "crew_wins"
+    assert belief.game_over_roles == {"red": "crewmate", "green": "imposter"}
+
+
+def test_meeting_call_to_playing_recovery() -> None:
+    """If the interstitial clears straight back to a live scene (e.g. a replayed
+    or aborted meeting), a camera-ready frame recovers Playing."""
+
+    from players.crewrift.crewborg.perception.entities import MeetingCall
+
+    belief = Belief()
+    _fold(belief, 1, crew_tasks_remaining=5)
+    _fold_interstitial(belief, 10, meeting_call=MeetingCall(caller_color="red"))
+    assert belief.phase == "MeetingCall"
+    _fold(belief, 90)
+    assert belief.phase == "Playing"

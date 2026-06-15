@@ -303,6 +303,38 @@ def test_unresolvable_target_falls_back_to_skip() -> None:
     assert command.held_mask == BTN_A  # confirms the skip, not a spin
 
 
+def test_vote_last_resort_confirms_after_step_budget() -> None:
+    # A cursor/grid that never decodes (no skip cell, no cursor movement) must not
+    # spin DOWN forever: past the step budget the resolver confirms wherever the
+    # cursor is — any vote beats the no-vote penalty.
+    belief = Belief()
+    belief.voting = VotingState(cursor_present=True)  # never reaches skip
+    action_state = ActionState()
+    intent = Intent(kind="vote")
+
+    for _ in range(200):  # far beyond any sane cursor walk
+        command = resolve_action(intent, belief, action_state)
+        if action_state.vote_confirmed:
+            break
+    assert action_state.vote_confirmed
+    assert command.held_mask == BTN_A
+
+
+def test_vote_last_resort_confirms_when_cursor_never_reaches_target() -> None:
+    # A targeted vote whose cursor the server never moves onto the target slot
+    # still ends in a confirmed vote within the budget.
+    belief = Belief()
+    belief.voting = _vote_grid()  # cursor stuck on slot 0; target blue is slot 1
+    action_state = ActionState()
+    intent = Intent(kind="vote", target_color="blue")
+
+    for _ in range(200):
+        resolve_action(intent, belief, action_state)
+        if action_state.vote_confirmed:
+            break
+    assert action_state.vote_confirmed
+
+
 def test_chat_emitted_once() -> None:
     action_state = ActionState()
     intent = Intent(kind="chat", text="gg")
@@ -346,6 +378,36 @@ def test_kill_navigates_then_edge_presses_a_in_range() -> None:
 
     far = _belief_with_target((300, 300), (50, 50))
     assert resolve_action(Intent(kind="kill", target_color="red"), far, ActionState()).held_mask == BTN_UP | BTN_LEFT
+
+
+def _belief_with_button(
+    self_xy: tuple[int, int], target_xy: tuple[int, int], button_xy: tuple[int, int]
+) -> Belief:
+    belief = _belief_with_target(self_xy, target_xy)
+    belief.map = MapData(
+        width=1235, height=659, tasks=(), vents=(), rooms=(),
+        button=MapRect(x=button_xy[0], y=button_xy[1], w=28, h=34),
+        home=MapPoint(x=0, y=0),
+    )
+    return belief
+
+
+def test_kill_press_suppressed_inside_button_zone() -> None:
+    # The server's A order is report -> button -> kill: a kill press from the
+    # emergency-button zone opens a meeting instead of killing (observed 3x in
+    # the v8 0.1.52 eval). In the zone: keep closing on the victim, never press.
+    in_zone = _belief_with_button((110, 110), (120, 110), button_xy=(100, 100))
+    command = resolve_action(Intent(kind="kill", target_color="red"), in_zone, ActionState())
+    assert command.held_mask & BTN_A == 0
+    assert command.held_mask == BTN_RIGHT  # closing on the victim instead
+
+    # Within the inflated margin just outside the rect: still suppressed.
+    margin = _belief_with_button((97, 110), (105, 110), button_xy=(100, 100))
+    assert resolve_action(Intent(kind="kill", target_color="red"), margin, ActionState()).held_mask & BTN_A == 0
+
+    # Clearly outside the zone: the normal fresh A press kills.
+    outside = _belief_with_button((300, 300), (300, 300), button_xy=(100, 100))
+    assert resolve_action(Intent(kind="kill", target_color="red"), outside, ActionState()).held_mask == BTN_A
 
 
 def _belief_with_vent(self_xy: tuple[int, int], vent_xy: tuple[int, int]) -> Belief:

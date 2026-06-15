@@ -13,18 +13,27 @@ from players.crewrift.crewborg.events import CrewborgEventTracer
 from players.crewrift.crewborg.map import MapData, load_croatoan_map
 from players.crewrift.crewborg.modes import (
     AttendMeetingMode,
+    CallButtonMode,
     CrewmateGhostMode,
     DickMode,
     EvadeMode,
     FleeMode,
     HuntMode,
     IdleMode,
+    JamButtonMode,
     NormalMode,
     PretendMode,
     ReportBodyMode,
     SearchMode,
+    SeekCrowdMode,
+    StakeoutMode,
 )
-from players.crewrift.crewborg.strategy import RuleBasedStrategy, update_event_log, update_suspicion
+from players.crewrift.crewborg.strategy import (
+    RuleBasedStrategy,
+    update_event_log,
+    update_suspicion,
+    update_tail_tracking,
+)
 from players.crewrift.crewborg.types import (
     ActionState,
     Belief,
@@ -52,6 +61,7 @@ def build_runtime(
     trace_sink: TraceSink | None = None,
     metrics_sink: MetricsSink | None = None,
     map_data: MapData | None = None,
+    episode_recorder: object | None = None,
 ) -> AgentRuntime[Observation, Percept, Belief, ActionState, Intent, Command]:
     """Assemble the crewborg ``AgentRuntime``.
 
@@ -64,15 +74,20 @@ def build_runtime(
     is baked once here (design §6) — ``map_data`` overrides the vendored
     ``croatoan`` bake (tests).
     Registers all modes: idle / normal / crewmate_ghost / attend_meeting /
-    dick_mode / report_body / flee (crewmate) and evade / pretend / search / hunt
+    dick_mode / report_body / flee / seek_crowd (crewmate) and evade / pretend / search / hunt
     (imposter). A ``CrewborgEventTracer`` is wired as the runtime's
     ``on_step_complete`` hook so crewborg emits its
     ``domain.*`` trace events through the configured sinks (design §11): the
     phase / sighting / objective / kill / vote outcomes *and* the knowledge layer
     behind them (per-player event log + suspicion posteriors, with a
-    ``suspicion_snapshot`` each meeting). ``CREWBORG_TRACE=debug`` adds the full
+    ``suspicion_snapshot`` each meeting).     ``CREWBORG_TRACE=debug`` adds the full
     per-tick dump; ``CREWBORG_TRACE_GROUPS`` / ``CREWBORG_TRACE_INCLUDE`` can
     target narrower event families without full debug volume.
+
+    ``episode_recorder`` (a duck-typed
+    :class:`~players.crewrift.crewborg.artifact.SqliteEpisodeRecorder`) lets the
+    tracer additionally stream the per-tick ``positions`` table and push episode
+    metadata (role / color / outcome) into the artifact's ``summary.json``.
     """
 
     registry: ModeRegistry[Belief, ActionState, Intent] = ModeRegistry()
@@ -80,6 +95,7 @@ def build_runtime(
     registry.register(NormalMode)
     registry.register(CrewmateGhostMode)
     registry.register(AttendMeetingMode)
+    registry.register(CallButtonMode)
     registry.register(DickMode)
     registry.register(ReportBodyMode)
     registry.register(FleeMode)
@@ -87,6 +103,9 @@ def build_runtime(
     registry.register(HuntMode)
     registry.register(PretendMode)
     registry.register(SearchMode)
+    registry.register(SeekCrowdMode)
+    registry.register(JamButtonMode)
+    registry.register(StakeoutMode)
 
     if map_data is None:
         map_data = load_croatoan_map()
@@ -97,6 +116,7 @@ def build_runtime(
         update_belief(belief, percept)
         update_agent_tracking(belief)
         update_event_log(belief)
+        update_tail_tracking(belief)
         update_suspicion(belief)
 
     return AgentRuntime(
@@ -112,7 +132,7 @@ def build_runtime(
             trace_sink=trace_sink,
             metrics_sink=metrics_sink,
         ),
-        on_step_complete=CrewborgEventTracer(),
+        on_step_complete=CrewborgEventTracer(episode_recorder=episode_recorder),
         trace_sink=trace_sink,
         metrics_sink=metrics_sink,
     )

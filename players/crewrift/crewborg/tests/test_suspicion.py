@@ -274,6 +274,146 @@ def test_a_confirmation_drives_the_posterior_to_near_one() -> None:
     assert belief.suspicion["red"] > 0.99  # overwhelming likelihood ratio
 
 
+# --- prior redistribution (remaining-K) --------------------------------------
+
+
+def test_prior_shrinks_once_a_confirmed_imposter_is_dead() -> None:
+    # 8 players, 2 imposters: baseline prior 2/7. With one confirmed imposter
+    # ejected, the hidden budget is 1 over the 6 remaining candidates.
+    belief = _crew_belief(total_players=8)
+    _add(belief, "red")
+    belief.roster["white"] = PlayerRecord(color="white", life_status="dead")
+    belief.confirmed_imposters = {"white"}
+    update_suspicion(belief)
+    assert belief.suspicion["red"] == pytest.approx(1 / 6)
+
+
+def test_prior_excludes_a_confirmed_alive_imposter_from_the_candidates() -> None:
+    # A confirmed-but-alive imposter holds one budget slot and is not a hidden
+    # candidate: the other players' prior is 1 hidden imposter over 6 candidates.
+    belief = _crew_belief(total_players=8)
+    _add(belief, "red")
+    _add(belief, "white")
+    belief.confirmed_imposters = {"white"}
+    update_suspicion(belief)
+    assert belief.suspicion["red"] == pytest.approx(1 / 6)
+    assert belief.suspicion["white"] > 0.99  # the catch itself is overwhelming
+
+
+# --- social (who-sus'd-who) evidence ------------------------------------------
+
+
+def _accusation(speaker: str, target: str, stance: str = "accuse", meeting_id: int = 10, has_evidence: bool = True):
+    from players.crewrift.crewborg.types import Accusation
+
+    return Accusation(
+        meeting_id=meeting_id, tick=meeting_id, speaker_color=speaker,
+        target_color=target, stance=stance, text="…", has_evidence=has_evidence,
+    )
+
+
+def test_defense_by_a_confirmed_imposter_raises_suspicion() -> None:
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    _add(belief, "white")
+    belief.confirmed_imposters = {"white"}
+    belief.accusations = [_accusation("white", "red", stance="defend")]
+    update_suspicion(belief)
+    assert belief.suspicion["red"] > belief.suspicion["blue"]
+
+
+def test_accusation_by_a_confirmed_imposter_lowers_suspicion() -> None:
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    _add(belief, "white")
+    belief.confirmed_imposters = {"white"}
+    belief.accusations = [_accusation("white", "red")]
+    update_suspicion(belief)
+    assert belief.suspicion["red"] < belief.suspicion["blue"]
+
+
+def test_crowd_accusation_needs_two_independent_speakers() -> None:
+    one = _crew_belief()
+    _add(one, "red")
+    _add(one, "blue")
+    one.accusations = [_accusation("green", "red")]
+    update_suspicion(one)
+    assert one.suspicion["red"] == pytest.approx(one.suspicion["blue"])  # one accuser: neutral
+
+    two = _crew_belief()
+    _add(two, "red")
+    _add(two, "blue")
+    two.accusations = [_accusation("green", "red"), _accusation("yellow", "red")]
+    update_suspicion(two)
+    assert two.suspicion["red"] > two.suspicion["blue"]
+
+
+# --- the plain-sus disinfo tell (2026-06-11 truecrew eval) -------------------
+
+
+def test_plain_sus_exculpates_the_named_target() -> None:
+    # A bare "<color> sus" with no evidence wording marks the named color as
+    # likely innocent (0/185 named a real imposter vs truecrew:v14).
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    belief.accusations = [_accusation("green", "red", has_evidence=False)]
+    update_suspicion(belief)
+    assert belief.suspicion["red"] < belief.suspicion["blue"]
+
+
+def test_plain_sus_raises_suspicion_of_the_speaker() -> None:
+    # …and marks the speaker as a likely imposter steering the meeting.
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    _add(belief, "green")
+    belief.accusations = [_accusation("green", "red", has_evidence=False)]
+    update_suspicion(belief)
+    assert belief.suspicion["green"] > belief.suspicion["blue"]
+
+
+def test_evidence_backed_accusation_beats_the_plain_sus_exculpation() -> None:
+    # Real evidence against the same color cancels the format-level tell.
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    belief.accusations = [
+        _accusation("green", "red", has_evidence=False),
+        _accusation("yellow", "red", has_evidence=True),
+    ]
+    update_suspicion(belief)
+    assert belief.suspicion["red"] >= belief.suspicion["blue"]
+
+
+def test_bare_accusations_never_count_as_crowd_corroboration() -> None:
+    # Two bare-sus speakers are a disinfo chorus, not independent corroboration.
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    belief.accusations = [
+        _accusation("green", "red", has_evidence=False),
+        _accusation("yellow", "red", has_evidence=False),
+    ]
+    update_suspicion(belief)
+    assert belief.suspicion["red"] < belief.suspicion["blue"]
+
+
+def test_voting_for_a_confirmed_imposter_is_crew_like() -> None:
+    from players.crewrift.crewborg.types import MeetingRecord
+
+    belief = _crew_belief()
+    _add(belief, "red")
+    _add(belief, "blue")  # baseline
+    belief.roster["white"] = PlayerRecord(color="white", life_status="dead")
+    belief.confirmed_imposters = {"white"}
+    belief.meeting_history = [MeetingRecord(meeting_id=10, votes={"red": "white", "blue": "skip"}, ejected_color="white")]
+    update_suspicion(belief)
+    assert belief.suspicion["red"] < belief.suspicion["blue"]
+
+
 # --- believed-imposters maintenance -----------------------------------------
 
 

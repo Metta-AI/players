@@ -36,7 +36,7 @@ versions, (2) bundles replay + per-slot traces + metadata into one directory per
 episode in a single pass, and (3) reads raw JSON against the routes directly, so
 it survives coworld client/server drift. That drift is real and recurring: the
 client ships behind the server. As of 2026-06-02 the published `coworld` CLI
-(0.1.13, the latest) is BROKEN against the live server because the server renamed
+(0.1.22 as of 2026-06-11; earlier 0.1.13 was broken) against the live server because the server renamed
 its episode-request API -- `/v2/episode-requests*` -> `/v2/experience-request*`
 (see endpoint map below) -- while the CLI still calls the old paths and 404s. So
 `coworld episodes`, `coworld replays`, and `coworld episode-logs` do not work

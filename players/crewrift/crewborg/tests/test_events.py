@@ -9,9 +9,15 @@ from __future__ import annotations
 
 from players.crewrift.crewborg.action import BTN_A, BTN_B, BTN_LEFT
 from players.crewrift.crewborg.events import CrewborgEventTracer
-from players.crewrift.crewborg.strategy.suspicion import VOTE_PROBABILITY
+from players.crewrift.crewborg.strategy.meeting.vote_policy import vote_bar
 from players.crewrift.crewborg.types import ActionState, Belief, BodyEntry, ChatEvent, Command, Intent, PlayerRecord
 from players.player_sdk import EventEmitter, ListMetricsSink, ListTraceSink, ModeDirective, StepContext
+
+
+def _spatial(**fields):
+    """Expected payload plus the spatial annotation every domain event carries."""
+
+    return {"self_x": None, "self_y": None, "room_id": None, **fields}
 
 
 class _Harness:
@@ -65,7 +71,7 @@ def test_events_are_domain_prefixed_and_carry_runtime_tick() -> None:
 
     [event] = h.events("domain.phase_change")
     assert event.tick == 1
-    assert event.data == {"from": "unknown", "to": "Playing"}
+    assert event.data == _spatial(**{"from": "unknown", "to": "Playing"})
 
 
 def test_phase_change_fires_once_per_transition() -> None:
@@ -85,7 +91,7 @@ def test_role_resolved_emitted_once() -> None:
     h.step(belief=Belief(self_role="imposter"))
 
     [event] = h.events("domain.role_resolved")
-    assert event.data == {"role": "imposter"}
+    assert event.data == _spatial(role="imposter")
 
 
 def test_body_sighted_once_per_body_with_counter() -> None:
@@ -96,7 +102,7 @@ def test_body_sighted_once_per_body_with_counter() -> None:
     h.step(belief=belief)  # same body still present: no re-emit
 
     [event] = h.events("domain.body_sighted")
-    assert event.data == {"body_id": 2003, "color": "green", "world_x": 110, "world_y": 100}
+    assert event.data == _spatial(body_id=2003, color="green", world_x=110, world_y=100)
     assert len(h.counters("domain.body_sighted")) == 1
 
 
@@ -122,20 +128,45 @@ def test_kill_landed_on_cooldown_edge() -> None:
     h.step(belief=belief)  # same kill tick: no re-emit
 
     [event] = h.events("domain.kill_landed")
-    assert event.data == {"world_x": 300, "world_y": 200}
+    # Spatially annotated with the (tracked) self fix; no prior kill attempt was
+    # observed in this harness, so no strike geometry is folded in.
+    assert event.data == {"world_x": 300, "world_y": 200, "self_x": 300, "self_y": 200, "room_id": None}
     assert len(h.counters("domain.kill_landed")) == 1
 
 
 def test_vote_cast_fires_once_per_meeting() -> None:
-    h = _Harness()
-    h.step(action_state=ActionState(vote_confirmed=False))
-    h.step(action_state=ActionState(vote_confirmed=True))  # cast
-    h.step(action_state=ActionState(vote_confirmed=True))  # still held: no re-emit
-    h.step(action_state=ActionState(vote_confirmed=False))  # action layer reset (intent changed)
-    h.step(action_state=ActionState(vote_confirmed=True))  # next meeting cast
+    """One vote_cast per meeting, even though the action layer's ``vote_confirmed``
+    latch flaps every time the meeting mode cycles its intents (vote → idle →
+    vote re-resets it). A vote is final once cast, so re-confirms within the same
+    meeting are not new casts."""
 
-    assert len(h.events("domain.vote_cast")) == 2
+    h = _Harness()
+    meeting = Belief(phase="Voting", phase_start_tick=10)
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=False))
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=True))  # cast
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=True))  # held: no re-emit
+    # The intent-change reset + re-confirm flap (the production ~64×/episode bug):
+    # still the same meeting, so no new event.
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=False))
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=True))
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=False))
+    h.step(belief=meeting, action_state=ActionState(vote_confirmed=True))
+
+    [event] = h.events("domain.vote_cast")
+    assert event.data["meeting_id"] == 10
+    assert len(h.counters("domain.vote_cast")) == 1
+
+    # A NEW meeting (fresh phase_start_tick) casts again.
+    h.step(belief=Belief(phase="Playing"), action_state=ActionState(vote_confirmed=False))
+    next_meeting = Belief(phase="Voting", phase_start_tick=99)
+    h.step(belief=next_meeting, action_state=ActionState(vote_confirmed=True))
+    assert [e.data["meeting_id"] for e in h.events("domain.vote_cast")] == [10, 99]
     assert len(h.counters("domain.vote_cast")) == 2
+
+    # vote_confirmed flapping outside Voting (no meeting) never emits.
+    h.step(belief=Belief(phase="Playing"), action_state=ActionState(vote_confirmed=False))
+    h.step(belief=Belief(phase="Playing"), action_state=ActionState(vote_confirmed=True))
+    assert len(h.events("domain.vote_cast")) == 2
 
 
 def test_task_started_on_new_target_and_resume_after_interruption() -> None:
@@ -159,8 +190,70 @@ def test_kill_attempted_requires_the_a_edge_in_the_command() -> None:
     # The fresh A press is the attempt.
     h.step(intent=Intent(kind="kill", target_id=1007), command=Command(held_mask=BTN_A))
     [event] = h.events("domain.kill_attempted")
-    assert event.data == {"target_id": 1007}
+    assert event.data["target_id"] == 1007
+    assert event.data["target_color"] is None
     assert len(h.counters("domain.kill_attempted")) == 1
+
+
+def test_kill_attempted_carries_geometry_and_kill_landed_inherits_it() -> None:
+    """The strike press records victim identity/position, distance, readiness age,
+    and the witnesses in LOS; the kill_landed outcome folds the same geometry in."""
+
+    from players.crewrift.crewborg.types import PerceptionFrame
+
+    h = _Harness()
+    belief = Belief(
+        self_role="imposter",
+        self_kill_ready=True,
+        kill_ready_since_tick=10,
+        last_tick=22,
+        self_world_x=100,
+        self_world_y=100,
+    )
+    belief.roster["green"] = PlayerRecord(
+        color="green", object_id=1004, world_x=112, world_y=109, last_seen_tick=22, life_status="alive"
+    )
+    belief.roster["blue"] = PlayerRecord(
+        color="blue", object_id=1005, world_x=140, world_y=100, last_seen_tick=22, life_status="alive"
+    )
+    belief.recent_frames.append(
+        PerceptionFrame(
+            tick=22,
+            camera_x=40,
+            camera_y=40,
+            players={"green": (112, 109), "blue": (140, 100)},
+        )
+    )
+
+    h.step(
+        belief=belief,
+        intent=Intent(kind="kill", target_color="green"),
+        command=Command(held_mask=BTN_A),
+    )
+    [attempt] = h.events("domain.kill_attempted")
+    assert attempt.data["target_color"] == "green"
+    assert attempt.data["target_id"] == 1004  # resolved from the roster
+    assert attempt.data["victim_x"] == 112
+    assert attempt.data["victim_y"] == 109
+    assert attempt.data["dist"] == 15.0  # sqrt(12² + 9²)
+    assert attempt.data["ticks_since_ready"] == 12  # last_tick 22 − ready_since 10
+    [witness] = attempt.data["witnesses"]  # the victim itself is excluded
+    assert witness["color"] == "blue"
+    assert witness["dist"] == 29.4  # to the victim: sqrt(28² + 9²)
+    assert witness["near"] is True
+    assert witness["teammate"] is False
+    assert attempt.data["self_x"] == 100  # spatial annotation
+
+    # The kill lands (ready→cooldown edge): the outcome inherits the geometry.
+    landed_belief = belief.model_copy(deep=True)
+    landed_belief.last_kill_tick = 23
+    h.step(belief=landed_belief)
+    [landed] = h.events("domain.kill_landed")
+    assert landed.data["target_color"] == "green"
+    assert landed.data["victim_x"] == 112
+    assert landed.data["dist"] == 15.0
+    assert landed.data["ticks_since_ready"] == 12
+    assert [w["color"] for w in landed.data["witnesses"]] == ["blue"]
 
 
 def test_report_vent_and_chat_attempts() -> None:
@@ -169,9 +262,9 @@ def test_report_vent_and_chat_attempts() -> None:
     h.step(intent=Intent(kind="vent", target_id=0), command=Command(held_mask=BTN_B))
     h.step(intent=Intent(kind="chat", text="no read, skipping"), command=Command(chat="no read, skipping"))
 
-    assert h.events("domain.report_attempted")[0].data == {"body_id": 2003}
+    assert h.events("domain.report_attempted")[0].data == _spatial(body_id=2003)
     assert h.events("domain.vent_attempted")
-    assert h.events("domain.chat_sent")[0].data == {"text": "no read, skipping"}
+    assert h.events("domain.chat_sent")[0].data == _spatial(text="no read, skipping")
 
 
 def test_chat_received_emits_each_meeting_line_once_and_resets_per_meeting() -> None:
@@ -188,12 +281,12 @@ def test_chat_received_emits_each_meeting_line_once_and_resets_per_meeting() -> 
 
     received = h.events("domain.chat_received")
     assert [event.data["meeting_id"] for event in received] == [10, 99]
-    assert received[0].data == {
-        "meeting_id": 10,
-        "speaker_color": "red",
-        "text": "where",
-        "chat_tick": 11,
-    }
+    assert received[0].data == _spatial(
+        meeting_id=10,
+        speaker_color="red",
+        text="where",
+        chat_tick=11,
+    )
     assert len(h.counters("domain.chat_received")) == 2
 
 
@@ -370,7 +463,7 @@ def test_player_died_fires_once_on_the_alive_to_dead_edge() -> None:
     h.step(belief=belief)  # still dead: no re-emit
 
     [event] = h.events("domain.player_died")
-    assert event.data == {"color": "blue", "source": "body", "death_tick": 40, "body_xy": [120, 80]}
+    assert event.data == _spatial(color="blue", source="body", death_tick=40, body_xy=[120, 80])
     assert len(h.counters("domain.player_died")) == 1
 
 
@@ -387,7 +480,7 @@ def test_imposter_confirmed_and_believed_changed_on_set_moves() -> None:
     [confirmed] = h.events("domain.imposter_confirmed")
     assert confirmed.data["color"] == "red"
     [changed] = h.events("domain.believed_changed")
-    assert changed.data == {"added": ["red"], "removed": [], "believed": ["red"]}
+    assert changed.data == _spatial(added=["red"], removed=[], believed=["red"])
 
     # Believed set shrinking is reported too; confirmed (a fixed latent) is not re-emitted.
     belief.believed_imposters = set()
@@ -416,7 +509,9 @@ def test_suspicion_snapshot_once_per_meeting_with_ranking_and_vote() -> None:
     assert [r["color"] for r in snap.data["ranking"]] == ["red", "blue"]  # sorted desc by P
     assert snap.data["would_vote"] == "red"
     assert snap.data["would_vote_p"] == 0.91
-    assert snap.data["vote_bar"] == VOTE_PROBABILITY
+    # The bar is state-dependent now (vote_policy): 8 declared players but only 2
+    # known alive reads as a must-eject endgame, so the bar collapses to 0.
+    assert snap.data["vote_bar"] == vote_bar(belief)
     assert snap.data["ranking"][0]["events"][0] == {
         "kind": "near_body", "dur": 4, "target": "green", "region": None, "min_dist": 5,
     }
@@ -574,16 +669,16 @@ def test_occupancy_reacquisition_events_are_emitted_once() -> None:
     h.step(belief=belief)
 
     [event] = h.events("domain.occupancy_reacquired")
-    assert event.data == {
-        "color": "green",
-        "predicted_cell": 2,
-        "actual_cell": 5,
-        "predicted_point": [20, 20],
-        "actual_point": [80, 16],
-        "top_probability": 0.25,
-        "distance_error": 60.13,
-        "disc_radius": 44.0,
-    }
+    assert event.data == _spatial(
+        color="green",
+        predicted_cell=2,
+        actual_cell=5,
+        predicted_point=[20, 20],
+        actual_point=[80, 16],
+        top_probability=0.25,
+        distance_error=60.13,
+        disc_radius=44.0,
+    )
     assert len(h.counters("domain.occupancy_reacquired")) == 1
 
 
@@ -657,6 +752,162 @@ def test_viewer_trace_emits_occupancy_grid_once() -> None:
     ]
 
 
+def test_meeting_called_emitted_once_per_meeting_with_attribution() -> None:
+    h = _Harness()
+    h.step(belief=Belief(phase="Playing", self_world_x=200, self_world_y=150))
+
+    meeting = Belief(
+        phase="MeetingCall",
+        phase_start_tick=50,
+        meeting_called_by="red",
+        meeting_trigger="report",
+        meeting_reported_body_color="green",
+    )
+    h.step(belief=meeting)
+    h.step(belief=meeting)  # same meeting: no re-emit
+
+    [event] = h.events("domain.meeting_called")
+    assert event.data["by"] == "red"
+    assert event.data["trigger"] == "report"
+    assert event.data["body_color"] == "green"
+    # Spatial annotation carries the LAST KNOWN fix (the camera is down during
+    # the interstitial, so belief's live position is None) — where we were when
+    # the meeting interrupted us.
+    assert event.data["self_x"] == 200
+    assert event.data["self_y"] == 150
+    assert h.counters("domain.meeting_called")[0].tags == {"trigger": "report"}
+
+    # A later meeting (new phase_start_tick) emits again.
+    h.step(belief=Belief(phase="Playing"))
+    button_meeting = Belief(
+        phase="MeetingCall", phase_start_tick=300, meeting_called_by="blue", meeting_trigger="button"
+    )
+    h.step(belief=button_meeting)
+    assert [e.data["by"] for e in h.events("domain.meeting_called")] == ["red", "blue"]
+
+
+def test_game_over_emitted_once_with_outcome_roles_and_census() -> None:
+    h = _Harness()
+    belief = Belief(phase="GameOver", game_outcome="crew_wins")
+    belief.roster["red"] = PlayerRecord(color="red", life_status="alive")
+    belief.roster["green"] = PlayerRecord(color="green", life_status="dead")
+    belief.game_over_roles = {"red": "crewmate", "green": "imposter"}
+    h.step(belief=belief)
+    h.step(belief=belief)  # no re-emit
+
+    [event] = h.events("domain.game_over")
+    assert event.data["outcome"] == "crew_wins"
+    assert event.data["alive_by_color"] == {"green": False, "red": True}
+    assert event.data["roles"] == {"green": "imposter", "red": "crewmate"}
+    assert h.counters("domain.game_over")[0].tags == {"outcome": "crew_wins"}
+
+
+def test_spatial_annotation_includes_room_and_survives_meetings() -> None:
+    from players.crewrift.crewborg.map.types import MapData, MapPoint, MapRect, Room
+
+    map_data = MapData(
+        width=400,
+        height=300,
+        tasks=(),
+        vents=(),
+        rooms=(Room(name="Engine", x=0, y=0, w=100, h=100), Room(name="Bridge", x=100, y=0, w=100, h=100)),
+        button=MapRect(x=10, y=10, w=8, h=8),
+        home=MapPoint(x=5, y=5),
+    )
+    h = _Harness()
+    h.step(belief=Belief(phase="Playing", map=map_data, self_world_x=150, self_world_y=50))
+    [event] = h.events("domain.phase_change")
+    assert event.data["self_x"] == 150
+    assert event.data["room_id"] == 1  # Bridge
+
+    # Camera down (meeting): the annotation keeps the last fix.
+    h.step(belief=Belief(phase="Voting", map=map_data))
+    voting_change = h.events("domain.phase_change")[-1]
+    assert voting_change.data["to"] == "Voting"
+    assert voting_change.data["self_x"] == 150
+    assert voting_change.data["room_id"] == 1
+
+
+class _FakeRecorder:
+    def __init__(self) -> None:
+        self.rows: list[dict] = []
+        self.info: dict = {}
+
+    def record_position(self, **row) -> None:
+        self.rows.append(row)
+
+    def set_episode_info(self, **fields) -> None:
+        self.info.update(fields)
+
+
+def test_tracer_streams_positions_and_episode_info_to_recorder() -> None:
+    from players.crewrift.crewborg.types import PerceptionFrame
+
+    recorder = _FakeRecorder()
+    trace = ListTraceSink()
+    metrics = ListMetricsSink()
+    emit = EventEmitter(trace, metrics, tick=0)
+    tracer = CrewborgEventTracer(debug=False, viewer=False, episode_recorder=recorder)
+
+    belief = Belief(
+        phase="Playing",
+        last_tick=1,
+        server_tick=4242,
+        self_role="imposter",
+        self_world_x=120,
+        self_world_y=90,
+    )
+    belief.voting = belief.voting.model_copy(update={"self_marker_color": "red"})
+    belief.recent_frames.append(
+        PerceptionFrame(tick=1, camera_x=60, camera_y=30, players={"green": (140, 95)})
+    )
+    emit.tick = 1
+    context = StepContext(
+        tick=1,
+        belief=belief,
+        action_state=ActionState(),
+        intent=Intent(kind="navigate_to", point=(150, 90)),
+        command=Command(held_mask=BTN_LEFT),
+        active_mode_name="search",
+        active_directive=ModeDirective(mode="search", source="strategy", reason="unit"),
+        emit=emit,
+    )
+    tracer(context)
+
+    [row] = recorder.rows
+    assert row["tick"] == 1
+    assert row["server_tick"] == 4242
+    assert row["self_x"] == 120
+    assert row["self_y"] == 90
+    assert row["mode"] == "search"
+    assert row["intent_kind"] == "navigate_to"
+    assert row["held_mask"] == BTN_LEFT
+    assert row["phase"] == "Playing"
+    assert row["visible"] == '[{"c":"green","x":140,"y":95}]'
+    # Role + color pushed into the artifact's episode metadata.
+    assert recorder.info["role"] == "imposter"
+    assert recorder.info["color"] == "red"
+
+    # Game over pushes the outcome too.
+    over = Belief(phase="GameOver", game_outcome="imps_win", last_tick=2)
+    emit.tick = 2
+    tracer(
+        StepContext(
+            tick=2,
+            belief=over,
+            action_state=ActionState(),
+            intent=Intent(kind="idle"),
+            command=Command(),
+            active_mode_name="idle",
+            active_directive=ModeDirective(mode="idle", source="default", reason="unit"),
+            emit=emit,
+        )
+    )
+    assert recorder.info["outcome"] == "imps_win"
+    assert recorder.rows[-1]["phase"] == "GameOver"
+    assert recorder.rows[-1]["visible"] == "[]"
+
+
 def test_env_flag_enables_debug_dump(monkeypatch) -> None:
     monkeypatch.setenv("CREWBORG_TRACE", "debug")
     tracer = CrewborgEventTracer()
@@ -697,5 +948,5 @@ def test_domain_event_flows_through_a_real_runtime_step() -> None:
 
     phase_events = [e for e in trace.events if e.name == "domain.phase_change"]
     assert phase_events
-    assert phase_events[0].data == {"from": "unknown", "to": "Lobby"}
+    assert phase_events[0].data == _spatial(**{"from": "unknown", "to": "Lobby"})
     assert phase_events[0].tick == 1

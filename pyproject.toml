@@ -30,6 +30,11 @@ cogsguard = [
     "cogsguard",
     "mettagrid",
 ]
+# The `coworld` CLI is used by crewborg's episode/replay tooling
+# (scripts/fetch_episodes.py, scripts/replay_analysis.py). Pin >=0.1.22, the
+# first release that targets the renamed `/v2/experience-request*` API (older
+# CLIs 404 on `coworld episodes`/`replays`/`episode-logs`).
+coworld = ["coworld>=0.1.22"]
 
 [tool.setuptools]
 include-package-data = true

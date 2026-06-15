@@ -76,6 +76,41 @@ class TaskSignal(BaseModel):
     screen: tuple[int, int]
 
 
+class GameInfo(BaseModel):
+    """Live game-config values read off the pre-game GAME INFO interstitial.
+
+    Each field is ``None`` when its line was absent/unparseable; ``max_ticks`` is
+    ``None`` for "GAME TIMER NONE" (no limit). Only attached to the resolved scene
+    when the "GAME INFO" title itself is on screen.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kill_cooldown_ticks: int | None = None
+    tasks_per_player: int | None = None
+    vote_timer_ticks: int | None = None
+    max_ticks: int | None = None
+
+
+MeetingTrigger = Literal["report", "button"]
+
+
+class MeetingCall(BaseModel):
+    """The meeting-call interstitial: who opened this meeting, and how.
+
+    ``caller_color`` comes from the caller icon (or the text line); ``None`` when
+    the caller has left the game ("Someone ..."). ``trigger`` is ``report`` /
+    ``button`` (``None`` when the cause is unknown); ``body_color`` is the
+    reported body's color for report-triggered meetings.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    caller_color: str | None = None
+    trigger: MeetingTrigger | None = None
+    body_color: str | None = None
+
+
 # A vote dot whose ``target`` is this sentinel is a skip vote (the game's vote
 # value −2 for skip; sim.nim).
 SKIP_VOTE_TARGET = -2
@@ -163,3 +198,16 @@ class ResolvedScene(BaseModel):
     # The color ejected by the just-finished vote, or ``None`` (vote skipped / not
     # a VoteResult frame).
     ejected_color: str | None = None
+
+    # The server's authoritative tick from the per-tick "tick <N>" marker sprite
+    # (upstream 2026-06-10), or ``None`` on older servers / before it arrives.
+    server_tick: int | None = None
+    # Live game config from the pre-game GAME INFO interstitial, or ``None`` when
+    # that screen is not showing (including on older servers without it).
+    game_info: GameInfo | None = None
+    # The meeting-call interstitial (who opened the meeting and how), or ``None``
+    # outside that screen (including on older servers without it).
+    meeting_call: MeetingCall | None = None
+    # Game-over roster role census, paired from the GameOver icons + IMP/CREW
+    # texts: color → "imposter" | "crewmate". Empty outside GameOver.
+    game_over_roles: dict[str, str] = Field(default_factory=dict)

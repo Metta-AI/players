@@ -62,15 +62,27 @@ yourself and them unsuspected is paramount."""
 # --- tier 3: per-role strategy (TUNE HERE) ------------------------------------
 
 CREWMATE_STRATEGY = """- Reason from the evidence in the context: suspicion.ranking (P(imposter) per
-  player), players[].recent_events (vents, bodies, proximity to kills), and the
-  live voting.tally.
+  player), players[].recent_events (vents, bodies, proximity to kills), the
+  live voting.tally, and the social record (who accused/defended whom across
+  every meeting, and how each player voted).
+- There are exactly game_state.imposters_total imposters;
+  game_state.imposters_remaining are still at large. Reason about the *team*:
+  players who consistently defend each other or never accuse each other are a
+  candidate imposter pair; accusations from a confirmed imposter are inverted
+  evidence (they scapegoat crew), and their defenses point at their teammate.
 - state.fallback_vote is your deterministic engine's best pick. Treat it as a
   strong default; override it only when the evidence points more convincingly at
   a different player.
 - In chat, share concrete, checkable observations ("saw blue vent near
   electrical") rather than vague accusations. Specific reads move votes.
 - Do not vote a player you have no real evidence against. A wrong ejection thins
-  the crew and helps the imposters — when genuinely unsure, prefer skip.
+  the crew and helps the imposters — when genuinely unsure, prefer skip. But if
+  game_state.must_eject is true, never skip: a skipped vote loses the game to
+  the next kill, so vote your best read even on weak evidence.
+- Avoid vote splits: ties and scattered votes eject no one, which helps the
+  imposters. Near the deadline, if game_state.plurality_target is plausibly
+  guilty (or game_state.anti_split_recommendation names a player), converge on
+  the forming consensus instead of holding a trailing vote.
 - Build toward a vote: set a tentative vote as evidence firms up and let it
   auto-submit near the deadline; submit early only when you are confident."""
 
@@ -78,16 +90,21 @@ IMPOSTER_STRATEGY = """- Blend in: behave like an honest crewmate who is reasoni
   Never reveal or hint that you are an imposter, and never reference your
   teammates as such.
 - Never accuse, vote, or cast suspicion on anyone listed in self.teammates. If a
-  teammate is under fire, defend them only when doing so does not put suspicion
-  on you.
+  teammate is under fire, defend them only sparingly and indirectly — the crew
+  studies the social record, and a visible mutual-defense pair is exactly the
+  pattern that exposes an imposter team.
 - Deflect suspicion away from yourself and your teammates toward a plausible,
-  isolated crewmate — ideally one who is already accumulating votes in
-  voting.tally, so you join a forming consensus rather than starting a lone
-  accusation.
+  isolated crewmate — ideally game_state.plurality_target or another player
+  already accumulating votes in voting.tally, so you join a forming consensus
+  rather than starting a lone accusation. A lone accusation trail in the social
+  record points back at you when its targets keep proving innocent.
 - If you are the one under suspicion, give a calm, specific alibi consistent
   with ordinary tasking. Do not over-explain; over-justifying reads as guilt.
-- When there is no safe scapegoat and pushing a vote would expose you, prefer
-  skip. A stalled crew vote runs the clock down in your favor."""
+- Vote with the crowd: joining the crew plurality on a non-teammate both looks
+  crew-like and helps eject a crewmate. When there is no safe pile-on and
+  pushing a vote would expose you, prefer skip — a stalled crew vote runs the
+  clock down in your favor, and if the crew is one eject from parity, surviving
+  this vote wins the game."""
 
 
 ROLE_GOALS: dict[str, str] = {

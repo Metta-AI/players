@@ -34,14 +34,29 @@ time decay):
   pass-through), **body proximity** (log-LR *decreases* with dwell — brief is the
   only window on a fleeing killer), **follow-to-death** (log-LR *increases* with how
   long the shadowing lasted).
+- Social cues over the episode accusation graph + meeting vote history
+  (``_social_log_lr``): defended-by / accused-by a confirmed imposter (their speech
+  is inverted evidence), crowd accusation by independent speakers (evidence-backed
+  lines only), the plain-sus disinfo tell (a bare "<color> sus" exculpates the
+  named color and incriminates the speaker — 2026-06-11 truecrew eval), and having
+  voted to eject a confirmed imposter (crew-like).
 
 `believed_imposters` (which gates Flee) is every alive player with `P ≥
 FLEE_PROBABILITY`. Crewmate-only — an imposter knows the truth, a ghost doesn't flee.
 
 v1 simplifications (documented for later): naive-Bayes independence between evidence
-types; positive-evidence-only (the prior is the baseline — no exculpatory terms);
-and a static `K / (P − 1)` prior without redistributing the imposter budget as
-players are confirmed/die (a proper joint model is a refinement).
+types. The prior now redistributes the imposter budget as players are confirmed or
+die (`_prior_imposter_p`); the social cues add the first (weak) exculpatory terms.
+A proper joint model over the full K-imposter assignment remains a refinement.
+
+TODO(meeting-call attribution): the meeting-call interstitial (upstream
+2026-06-10) now exposes WHO opened every meeting and how
+(``belief.meeting_called_by`` / ``meeting_trigger`` / ``MeetingRecord.called_by``).
+Candidate cues to fit per docs/designs/suspicion.md §6 before wiring in:
+self-report patterns (reporter of a body they were last seen near), serial
+reporters across meetings, and button calls correlated with imposter cooldown
+resets. Raw reporter identity alone is ~LR 1 (innocent crew report bodies too),
+so no log-LR term is added until the conditional cues are fitted offline.
 """
 
 from __future__ import annotations
@@ -88,6 +103,32 @@ FOLLOW_FULL_TICKS = 48  # the ramp reaches full at ~2 s of sustained proximity
 FOLLOW_DEATH_WINDOW_TICKS = 72  # the follow ended ~within 3 s of finding the body
 FOLLOW_LOG_LR = math.log(6.0)
 
+# Social (who-sus'd-who) cues from the episode accusation graph + meeting vote
+# history (docs/designs/suspicion.md §3.6). Each is a boolean per player, so it
+# contributes at most once — naturally bounded like the max-aggregated cues.
+# Confirmed imposters defend each other and scapegoat crew, so their speech is
+# *inverted* evidence; voting a confirmed imposter out is crew-like behaviour.
+SOCIAL_DEFENDED_BY_CONFIRMED_LOG_LR = math.log(4.0)
+SOCIAL_ACCUSED_BY_CONFIRMED_LOG_LR = -math.log(2.0)
+SOCIAL_VOTED_FOR_CONFIRMED_LOG_LR = -math.log(2.0)
+# Independent corroboration: distinct (non-confirmed, non-self) accusers piling
+# onto the same player is weak positive evidence — crowds are sometimes right.
+# Counts only *evidence-backed* accusations (``Accusation.has_evidence``): bare
+# "<color> sus" assertions are a disinfo channel, not corroboration (2026-06-11
+# truecrew eval: 0/185 bare-sus lines named a real imposter).
+SOCIAL_CROWD_MIN_ACCUSERS = 2
+SOCIAL_CROWD_ACCUSED_LOG_LR = math.log(1.5)
+# The plain-sus disinfo tell (2026-06-11 truecrew eval, new chat-format cue):
+# a bare "<color> sus" with no evidence wording exculpates the *named* color
+# (0/185 named a real imposter; 11/16 wrong ejections followed one) and marks
+# the *speaker* as likely steering the meeting (imposters frame crew this way).
+# Magnitudes deliberately conservative — the tell was measured against one
+# opponent engine; both cues are boolean per player (contribute at most once).
+# The exculpation only applies while no evidence-backed accusation names the
+# same color (real evidence beats format-level disinfo).
+PLAIN_SUS_TARGET_LOG_LR = -math.log(3.0)
+PLAIN_SUS_SPEAKER_LOG_LR = math.log(2.0)
+
 # Flee a player once P(imposter) reaches this — a real probability, so the bar is
 # interpretable (only near-certainty triggers the reactive Flee).
 FLEE_PROBABILITY = 0.9
@@ -129,8 +170,24 @@ def _imposter_count(belief: Belief) -> int:
 
 
 def _prior_imposter_p(belief: Belief) -> float:
-    n_others = max(1, belief.total_player_count - 1)
-    return min(max(_imposter_count(belief) / n_others, PRIOR_MIN), PRIOR_MAX)
+    """The marginal prior for an *unconfirmed* player: hidden K over candidates.
+
+    The static ``K / (P − 1)`` ignores what we have learned: every confirmed
+    imposter (alive or dead) is attributed budget, and dead players are no longer
+    candidates. The remaining hidden budget is spread over the remaining
+    unconfirmed, not-known-dead others — so catching one of two imposters roughly
+    halves everyone else's prior instead of leaving it stale.
+    """
+
+    k_hidden = max(0, _imposter_count(belief) - len(belief.confirmed_imposters))
+    dead_others = sum(1 for record in belief.roster.values() if record.life_status == "dead")
+    confirmed_alive = sum(
+        1
+        for color in belief.confirmed_imposters
+        if (record := belief.roster.get(color)) is None or record.life_status != "dead"
+    )
+    n_candidates = max(1, belief.total_player_count - 1 - dead_others - confirmed_alive)
+    return min(max(k_hidden / n_candidates, PRIOR_MIN), PRIOR_MAX)
 
 
 # --- tier 1: near-certain transitions → confirmed_imposters ------------------
@@ -227,6 +284,75 @@ def _graded_log_lr(belief: Belief, record: PlayerRecord) -> float:
     return vent + body + follow
 
 
+def _social_log_lr(belief: Belief, color: str) -> float:
+    """Who-sus'd-who evidence for one player, from accusations + vote history.
+
+    Six boolean cues (each contributes once, keeping the total bounded):
+
+    - defended by a confirmed imposter → up (teammates defend each other);
+    - accused by a confirmed imposter → down (imposters scapegoat crew);
+    - accused with evidence by ≥ ``SOCIAL_CROWD_MIN_ACCUSERS`` distinct ordinary
+      speakers → up (our own and confirmed imposters' accusations are excluded —
+      ours would feed back into the posterior, theirs is inverted evidence
+      handled above; bare no-evidence accusations never count as corroboration);
+    - named by a bare "<color> sus" line with no evidence-backed accusation
+      against them → down (the plain-sus disinfo tell exculpates the target);
+    - spoke a bare "<color> sus" accusation themselves → up (the speaker is
+      likely an imposter steering the meeting);
+    - ever voted to eject a confirmed imposter → down (crew-like behaviour).
+    """
+
+    confirmed = belief.confirmed_imposters
+    self_color = belief.voting.self_marker_color
+    defended_by_confirmed = False
+    accused_by_confirmed = False
+    crowd_accusers: set[str] = set()
+    plain_sus_named = False  # this player was the target of a bare accusation
+    evidence_named = False  # …or of an evidence-backed one (beats the tell)
+    plain_sus_spoke = False  # this player uttered a bare accusation
+    for accusation in belief.accusations:
+        speaker = accusation.speaker_color
+        if (
+            accusation.stance == "accuse"
+            and not accusation.has_evidence
+            and speaker == color
+            and accusation.target_color != color
+        ):
+            plain_sus_spoke = True
+        if accusation.target_color != color:
+            continue
+        if speaker == color:
+            continue
+        if accusation.stance == "defend":
+            defended_by_confirmed = defended_by_confirmed or speaker in confirmed
+            continue
+        if speaker in confirmed:
+            accused_by_confirmed = True
+            continue
+        if not accusation.has_evidence:
+            if speaker != self_color:
+                plain_sus_named = True
+            continue
+        evidence_named = True
+        if speaker is not None and speaker != self_color:
+            crowd_accusers.add(speaker)
+
+    total = 0.0
+    if defended_by_confirmed:
+        total += SOCIAL_DEFENDED_BY_CONFIRMED_LOG_LR
+    if accused_by_confirmed:
+        total += SOCIAL_ACCUSED_BY_CONFIRMED_LOG_LR
+    if len(crowd_accusers) >= SOCIAL_CROWD_MIN_ACCUSERS:
+        total += SOCIAL_CROWD_ACCUSED_LOG_LR
+    if plain_sus_named and not evidence_named:
+        total += PLAIN_SUS_TARGET_LOG_LR
+    if plain_sus_spoke:
+        total += PLAIN_SUS_SPEAKER_LOG_LR
+    if confirmed and any(record.votes.get(color) in confirmed for record in belief.meeting_history):
+        total += SOCIAL_VOTED_FOR_CONFIRMED_LOG_LR
+    return total
+
+
 # --- combine into the posterior ---------------------------------------------
 
 
@@ -244,6 +370,8 @@ def _recompute(belief: Belief) -> None:
             logit += WITNESSED_LOG_LR  # any near-certain catch — overwhelming
         if record is not None:
             logit += _graded_log_lr(belief, record)
+        logit += _social_log_lr(belief, color)
+        logit += _hunter_log_lr(belief, color)
         p = _sigmoid(logit)
         suspicion[color] = p
         if p >= FLEE_PROBABILITY:
@@ -251,6 +379,23 @@ def _recompute(belief: Belief) -> None:
 
     belief.suspicion = suspicion
     belief.believed_imposters = believed
+
+
+def _hunter_log_lr(belief: Belief, color: str) -> float:
+    """Hunter-profile behavioral evidence (0.0 unless ``CREWBORG_HUNTER`` is set).
+
+    The early-button-caller fingerprint (``strategy.hunter``): a *button*
+    meeting opened within ~250 ticks of a segment start is sussyboi's imposter
+    signature (its crew presses at ~500, the cooldown-jam timing). Moderate
+    evidence — some crews also rush the button — so it stacks with the graded /
+    social terms instead of convicting alone.
+    """
+
+    from players.crewrift.crewborg.strategy.hunter import early_button_caller_log_lr, hunter_enabled
+
+    if not hunter_enabled():
+        return 0.0
+    return early_button_caller_log_lr(belief, color)
 
 
 def top_suspect(belief: Belief) -> str | None:

@@ -54,7 +54,20 @@ IntentKind = Literal[
 ]
 
 # Game phases (sim.nim phase machine). ``unknown`` until the first phase signal.
-Phase = Literal["unknown", "Lobby", "RoleReveal", "Playing", "Voting", "VoteResult", "GameOver"]
+# ``GameInfo`` (pre-game settings screen, before RoleReveal) and ``MeetingCall``
+# (the 3 s "who called this meeting" screen between Playing and Voting) were added
+# upstream 2026-06-10; older servers never produce them.
+Phase = Literal[
+    "unknown",
+    "Lobby",
+    "GameInfo",
+    "RoleReveal",
+    "Playing",
+    "MeetingCall",
+    "Voting",
+    "VoteResult",
+    "GameOver",
+]
 
 
 class Observation(BaseModel):
@@ -97,9 +110,9 @@ ROSTER_HISTORY_MAX = 64
 # A player's life status. ``unknown`` until we have seen them alive in-world or
 # learned their state from the meeting census / a body / an ejection.
 LifeStatus = Literal["alive", "dead", "unknown"]
-# How we learned a player died — an in-world body, the meeting census, or the
-# vote-result ejection.
-DeathSource = Literal["body", "census", "ejection"]
+# How we learned a player died — an in-world body, the meeting census, the
+# vote-result ejection, or the meeting-call interstitial naming the reported body.
+DeathSource = Literal["body", "census", "ejection", "report"]
 
 # An observed interaction we logged about another player (design §5.2). All are
 # **durative**: an interval of contiguous observation. ``room``/``task``/``vent``
@@ -234,6 +247,59 @@ class ChatEvent(BaseModel):
     text: str
 
 
+class Accusation(BaseModel):
+    """One parsed who-sus'd-who edge from meeting chat (design §5 social).
+
+    Produced by :func:`...strategy.meeting.social.parse_stances` over each new
+    chat line and accumulated for the whole episode (unlike ``chat_log``, which
+    is cleared per meeting): accusation patterns across meetings are evidence —
+    imposters scapegoat crew and defend each other.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meeting_id: int  # the meeting's phase_start_tick
+    tick: int
+    speaker_color: str | None  # None if the line could not be attributed
+    target_color: str
+    stance: Literal["accuse", "defend"]
+    text: str
+    # Whether the line carried evidence wording (a body / vent / sighting…) per
+    # :func:`...strategy.meeting.social.has_evidence_context`. A bare ``"<color>
+    # sus"`` assertion (``False``) is treated as disinfo by the suspicion model
+    # and never qualifies for the vote policy's pile-on (2026-06-11 truecrew
+    # eval: 0/185 bare-sus lines named a real imposter).
+    has_evidence: bool = False
+
+
+class MeetingRecord(BaseModel):
+    """The outcome of one finished (or in-progress) meeting (design §5 social).
+
+    ``votes`` maps voter color → target color (or ``"skip"``), refreshed from the
+    live vote dots every Voting tick so the record naturally freezes at the final
+    tally when the meeting closes. ``ejected_color`` is filled from the
+    vote-result interstitial. ``called_by``/``trigger``/``reported_body_color``
+    come from the meeting-call interstitial (upstream 2026-06-10) — who opened
+    the meeting and how; ``None`` on older servers. Episode-persistent: who voted
+    with whom — and whether that vote landed on a later-confirmed imposter — is
+    evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meeting_id: int  # the meeting's phase_start_tick
+    votes: dict[str, str] = Field(default_factory=dict)
+    ejected_color: str | None = None
+    called_by: str | None = None
+    trigger: Literal["report", "button"] | None = None
+    reported_body_color: str | None = None
+    # Playing ticks elapsed in the interrupted segment when the meeting-call
+    # interstitial opened (None on older servers / when the anchor was unknown).
+    # Caller timing is a behavioral fingerprint: sussyboi's imposter presses the
+    # button at offsets ~150, its crew at ~500 (strategy.hunter).
+    called_elapsed_ticks: int | None = None
+
+
 # How many recent raw observation frames the perception tape keeps (~1 s at 24 Hz).
 RECENT_FRAMES_MAX = 24
 
@@ -317,6 +383,43 @@ class Belief(BaseModel):
     phase: Phase = "unknown"
     phase_start_tick: int = 0
 
+    # The server's authoritative tick, read off the per-tick "tick <N>" marker
+    # sprite (upstream 2026-06-10). ``None`` on older servers. This is the same
+    # tick counter the server's .bitreplay uses, so it joins crewborg's trace to
+    # the replay timeline; the runtime's own ``last_tick`` (bridge message count)
+    # can drift from it when frames are dropped or arrive before the game loop.
+    server_tick: int | None = None
+
+    # Live game config learned from the pre-game GAME INFO interstitial (upstream
+    # 2026-06-10): the actual killCooldownTicks / tasksPerPlayer / voteTimerTicks /
+    # maxTicks this episode runs with. ``None`` until seen (older servers never
+    # show the screen). Consumers fall back to conservative defaults when unset.
+    kill_cooldown_config_ticks: int | None = None
+    tasks_per_player: int | None = None
+    vote_timer_ticks: int | None = None
+    game_max_ticks: int | None = None
+
+    # Who opened the current/most recent meeting, and how — from the meeting-call
+    # interstitial (upstream 2026-06-10; previously unobservable). Latched when the
+    # MeetingCall screen shows and kept through Voting/VoteResult so suspicion /
+    # analysis can attribute the meeting; reset when the next MeetingCall opens.
+    # ``meeting_trigger`` is "report" | "button"; ``meeting_reported_body_color``
+    # is the reported body's color for report-triggered meetings.
+    meeting_called_by: str | None = None
+    meeting_trigger: Literal["report", "button"] | None = None
+    meeting_reported_body_color: str | None = None
+    # Playing ticks elapsed in the interrupted segment when the current meeting's
+    # call interstitial opened (the kill-cooldown anchor is reset every meeting →
+    # Playing transition, so this is the caller's button/report *segment offset*).
+    meeting_call_elapsed_ticks: int | None = None
+
+    # Game outcome, read from the GameOver interstitial title text. ``None`` until
+    # the game ends.
+    game_outcome: Literal["draw", "crew_wins", "imps_win"] | None = None
+    # End-of-game ground-truth roles by color, paired from the GameOver roster
+    # icons + IMP/CREW texts: color → "imposter" | "crewmate".
+    game_over_roles: dict[str, str] = Field(default_factory=dict)
+
     # Voting (design §5 voting).
     voting: VotingState = Field(default_factory=VotingState)
 
@@ -324,6 +427,13 @@ class Belief(BaseModel):
     # ticks and cleared when a new meeting opens. The raw transcript suspicion
     # reasoning will consume.
     chat_log: list[ChatEvent] = Field(default_factory=list)
+
+    # Episode-persistent social history (design §5 social): the who-sus'd-who
+    # accusation graph parsed from every meeting's chat, and each meeting's final
+    # vote tally + ejection. Never cleared — cross-meeting accusation and voting
+    # patterns feed the suspicion model and the meeting LLM context.
+    accusations: list[Accusation] = Field(default_factory=list)
+    meeting_history: list[MeetingRecord] = Field(default_factory=list)
 
     # Social / evidence (design §5, §10.1). Bayesian: ``suspicion[color]`` is the
     # posterior **P(imposter)** ∈ [0, 1] for each other player (crewmate POV),
@@ -339,6 +449,14 @@ class Belief(BaseModel):
     # Imposter teammates' colors, learned from the role-reveal icons (design §7.2),
     # so Hunt never targets a fellow imposter (the server's kill skips them).
     teammate_colors: set[str] = Field(default_factory=set)
+
+    # Follower ("tail") tracking (crewmate survival): per-color shadowing streaks
+    # as ``color -> (streak_start_tick, last_within_tick)`` for players recently
+    # observed within tail range of us. 34/46 of our crewmate deaths in the
+    # 2026-06-11 replay reconstruction were 6-12 s shadow kills with the killer
+    # inside our LoS the whole approach; maintained each Playing tick by
+    # ``strategy.shadow.update_tail_tracking`` and read by ``active_tail``.
+    tail_streaks: dict[str, tuple[int, int]] = Field(default_factory=dict)
 
     # Imposter: tick of the most recent self kill (kill-ready → cooldown edge),
     # surfaced in the kill-readiness trace (events.py §11).
@@ -399,6 +517,10 @@ class ActionState(BaseModel):
     # Whether the current vote intent has been confirmed (A pressed on the choice),
     # so we don't re-press once the vote is cast.
     vote_confirmed: bool = False
+    # Registered cursor-step presses for the current vote intent. Bounds the
+    # cursor walk: past the budget the resolver confirms wherever the cursor is,
+    # because any vote beats the no-vote penalty (design §12).
+    vote_steps: int = 0
     # Whether the current chat intent's text has been emitted (sent once).
     chat_sent: bool = False
     # Tick of the most recent emergency-button A press. The strategy uses this to
@@ -435,19 +557,28 @@ def derive_phase(resolved: ResolvedScene, current: Phase) -> Phase:
         return "GameOver"
     if texts & {"IMPS", "CREWMATE"}:
         return "RoleReveal"
+    if "GAME INFO" in texts:
+        return "GameInfo"
     if texts & {"WAITING", "NEED MORE!", "STARTING"}:
         return "Lobby"
     if texts & {"NO ONE", "WAS KILLED"}:
         return "VoteResult"
+    # The meeting-call interstitial (3 s between Playing and Voting, upstream
+    # 2026-06-10). Checked before Voting: its screen shows no voting UI, and the
+    # resolver only reports a meeting call when the voting UI is absent.
+    if resolved.meeting_call is not None:
+        return "MeetingCall"
     if resolved.voting.active or "SKIP" in texts:
         return "Voting"
 
     # No transitional signal. Infer Playing from a live scene: when a reveal /
     # meeting has just cleared, or (for a mid-game join) when Playing-specific
-    # signals — the crew task counter or task bubbles — are present.
+    # signals — the crew task counter or task bubbles — are present. A live camera
+    # (the world-map object is only streamed during Playing) is what clears the
+    # interstitial phases, including the new GameInfo / MeetingCall ones.
     if not resolved.camera_ready:
         return current
-    if current in ("RoleReveal", "VoteResult", "Voting", "Playing"):
+    if current in ("GameInfo", "RoleReveal", "MeetingCall", "VoteResult", "Voting", "Playing"):
         return "Playing"
     if resolved.crew_tasks_remaining is not None or resolved.task_signals:
         return "Playing"
@@ -570,12 +701,44 @@ def update_belief(belief: Belief, percept: Percept) -> None:
         else:
             _record_death(belief, entry.color, percept.tick, "census")
 
-    # The vote-result interstitial names the player the meeting ejected.
+    # The vote-result interstitial names the player the meeting ejected; also
+    # close out the meeting's record with the ejection.
     if resolved.ejected_color is not None:
         _record_death(belief, resolved.ejected_color, percept.tick, "ejection")
+        if belief.meeting_history and belief.meeting_history[-1].ejected_color is None:
+            belief.meeting_history[-1].ejected_color = resolved.ejected_color
+
+    # The server's authoritative tick marker, when present (older servers: None).
+    if resolved.server_tick is not None:
+        belief.server_tick = resolved.server_tick
+
+    # Live game config from the pre-game GAME INFO interstitial.
+    if resolved.game_info is not None:
+        info = resolved.game_info
+        if info.kill_cooldown_ticks is not None:
+            belief.kill_cooldown_config_ticks = info.kill_cooldown_ticks
+        if info.tasks_per_player is not None:
+            belief.tasks_per_player = info.tasks_per_player
+        if info.vote_timer_ticks is not None:
+            belief.vote_timer_ticks = info.vote_timer_ticks
+        if info.max_ticks is not None:
+            belief.game_max_ticks = info.max_ticks
 
     phase = derive_phase(resolved, belief.phase)
     if phase != belief.phase:
+        if phase == "MeetingCall":
+            # A fresh meeting opens: reset the previous meeting's attribution so
+            # the latched fields below describe only the current meeting.
+            belief.meeting_called_by = None
+            belief.meeting_trigger = None
+            belief.meeting_reported_body_color = None
+            # How deep into the interrupted Playing segment the call landed —
+            # the caller-timing fingerprint (strategy.hunter).
+            belief.meeting_call_elapsed_ticks = (
+                percept.tick - belief.kill_cooldown_start_tick
+                if previous_phase == "Playing" and belief.kill_cooldown_start_tick is not None
+                else None
+            )
         if phase == "Voting":
             # A meeting clears the previous transcript and — matching the server,
             # which removes all bodies when a meeting opens — our body beliefs, so a
@@ -587,6 +750,30 @@ def update_belief(belief: Belief, percept: Percept) -> None:
             belief.visible_body_ids.clear()
         belief.phase = phase
         belief.phase_start_tick = percept.tick
+
+    # Latch the meeting-call attribution (who opened the meeting, and how) while
+    # the interstitial shows; it persists through Voting/VoteResult.
+    if resolved.meeting_call is not None:
+        call = resolved.meeting_call
+        if call.caller_color is not None:
+            belief.meeting_called_by = call.caller_color
+        if call.trigger is not None:
+            belief.meeting_trigger = call.trigger
+        if call.body_color is not None:
+            belief.meeting_reported_body_color = call.body_color
+            # The interstitial names the reported body — that player is dead,
+            # even if we never saw the body in-world.
+            _record_death(belief, call.body_color, percept.tick, "report")
+
+    # Game outcome + end-of-game ground-truth roles from the GameOver screen.
+    if "CREW WINS" in resolved.phase_texts:
+        belief.game_outcome = "crew_wins"
+    elif "IMPS WIN" in resolved.phase_texts:
+        belief.game_outcome = "imps_win"
+    elif "DRAW" in resolved.phase_texts:
+        belief.game_outcome = "draw"
+    if resolved.game_over_roles:
+        belief.game_over_roles.update(resolved.game_over_roles)
 
     # Game start and meeting close reset every alive imposter's killCooldown. This
     # transition is visible to every role, so crewmate strategy can time emergency
@@ -605,6 +792,7 @@ def update_belief(belief: Belief, percept: Percept) -> None:
                 belief.chat_log.append(
                     ChatEvent(tick=percept.tick, speaker_color=line.speaker_color, text=line.text)
                 )
+                _record_accusations(belief, percept.tick, line.speaker_color, line.text)
 
     # The role-reveal "IMPS" interstitial confirms we are an imposter and shows
     # only our teammates' icons; record their colors so Hunt never targets them.
@@ -649,3 +837,65 @@ def update_belief(belief: Belief, percept: Percept) -> None:
         belief.self_role = "crewmate"
 
     belief.voting = resolved.voting
+
+    # Maintain this meeting's record (design §5 social): refresh the vote tally
+    # from the live dots every Voting tick, so the record freezes at the final
+    # tally when the meeting closes (the ejection is filled in above).
+    if belief.phase == "Voting":
+        _refresh_meeting_record(belief)
+
+
+def _record_accusations(belief: Belief, tick: int, speaker_color: str | None, text: str) -> None:
+    """Parse one new chat line into who-sus'd-who edges on ``belief.accusations``."""
+
+    # Imported lazily: the meeting package's __init__ pulls modules that import
+    # this one, so a module-level import here would be circular. The parser
+    # itself is pure (no crewborg imports).
+    from players.crewrift.crewborg.strategy.meeting.social import (
+        has_evidence_context,
+        parse_stances,
+    )
+
+    has_evidence = has_evidence_context(text)
+    for target_color, stance in parse_stances(speaker_color, text):
+        belief.accusations.append(
+            Accusation(
+                meeting_id=belief.phase_start_tick,
+                tick=tick,
+                speaker_color=speaker_color,
+                target_color=target_color,
+                stance=stance,
+                text=text,
+                has_evidence=has_evidence,
+            )
+        )
+
+
+def _refresh_meeting_record(belief: Belief) -> None:
+    """Upsert the current meeting's :class:`MeetingRecord` from the live dots."""
+
+    voting = belief.voting
+    record = belief.meeting_history[-1] if belief.meeting_history else None
+    if record is None or record.meeting_id != belief.phase_start_tick:
+        record = MeetingRecord(meeting_id=belief.phase_start_tick)
+        belief.meeting_history.append(record)
+    # Attribution latched from the meeting-call interstitial that preceded this
+    # Voting phase (None on older servers without the interstitial).
+    if record.called_by is None:
+        record.called_by = belief.meeting_called_by
+    if record.trigger is None:
+        record.trigger = belief.meeting_trigger
+    if record.reported_body_color is None:
+        record.reported_body_color = belief.meeting_reported_body_color
+    if record.called_elapsed_ticks is None:
+        record.called_elapsed_ticks = belief.meeting_call_elapsed_ticks
+
+    slot_to_color = {candidate.slot: candidate.color for candidate in voting.candidates}
+    votes: dict[str, str] = {}
+    for dot in voting.dots:
+        voter_color = slot_to_color.get(dot.voter)
+        if voter_color is None:
+            continue
+        votes[voter_color] = "skip" if dot.is_skip else slot_to_color.get(dot.target, str(dot.target))
+    if votes:
+        record.votes = votes

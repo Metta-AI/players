@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from players.crewrift.crewborg.map.types import MapData, MapPoint, MapRect, TaskStation
+from players.crewrift.crewborg.map.types import MapData, MapPoint, MapRect, Room, TaskStation
 from players.crewrift.crewborg.modes import CrewmateGhostMode, NormalMode
 from players.crewrift.crewborg.nav import build_nav_graph
-from players.crewrift.crewborg.types import ActionState, Belief
+from players.crewrift.crewborg.types import ActionState, Belief, PlayerRecord
 
 
 def _map_with_tasks() -> MapData:
@@ -88,15 +88,27 @@ def test_completes_when_bubble_gone_after_high_progress() -> None:
     assert intent.kind == "complete_task" and intent.task_index == 1  # moved on
 
 
-def test_done_only_when_no_task_signals_remain() -> None:
-    # Signals empty ⇒ done, even though our completed set says nothing finished
-    # (we trust the live arrows+bubbles, not the bookkeeping).
+def test_no_signal_redispatches_to_remembered_assigned_tasks() -> None:
+    # Signals empty but assigned tasks not known complete ⇒ walk to the nearest
+    # remembered station instead of idling at spawn (the v4 Bridge-blob fix).
+    # Standing at a station that shows no signal proves it done (in-view
+    # incomplete assigned tasks always signal), so task 0 — under our feet,
+    # signal-less — is marked completed and task 1 becomes the goal.
     belief = Belief(
         map=_map_with_tasks(), assigned_task_indices={0, 1}, visible_task_indices=set(),
         self_world_x=110, self_world_y=110, crew_tasks_remaining=5,
     )
     intent = NormalMode().decide(belief, ActionState())
-    assert intent.kind == "navigate_to" and intent.point == (0, 0)  # home
+    assert 0 in belief.completed_task_indices
+    assert intent.kind == "navigate_to" and intent.task_index == 1
+    assert intent.point == (510, 510)
+
+    # Both stations checked and signal-less ⇒ all done; with no crew tracked,
+    # head home.
+    belief.self_world_x, belief.self_world_y = 510, 510
+    done = NormalMode().decide(belief, ActionState())
+    assert 1 in belief.completed_task_indices
+    assert done.kind == "navigate_to" and done.point == (0, 0)  # home
 
 
 def test_resignalled_task_is_repursued_even_if_marked_completed() -> None:
@@ -120,6 +132,69 @@ def test_returns_to_the_start_room_when_all_tasks_are_done() -> None:
     )
     intent = NormalMode().decide(belief, ActionState())
     assert intent.kind == "navigate_to" and intent.point == (0, 0)  # back to spawn, not idle
+
+
+def test_tasks_done_drifts_to_known_crew_instead_of_spawn() -> None:
+    # Survival posture (the v4 Bridge-blob fix): with tasks done and crew
+    # tracked, stand near witnesses rather than idling alone at spawn.
+    belief = Belief(
+        map=_map_with_tasks(),
+        assigned_task_indices={0, 1},
+        completed_task_indices={0, 1},
+        self_world_x=110,
+        self_world_y=110,
+        last_tick=100,
+    )
+    belief.roster["green"] = PlayerRecord(
+        color="green", world_x=400, world_y=400, last_seen_tick=90, life_status="alive"
+    )
+    intent = NormalMode().decide(belief, ActionState())
+    assert intent.kind == "navigate_to" and intent.point == (400, 400)
+    assert intent.reason == "tasks done: staying near crew"
+
+    # A ghost can't be killed: it still heads home.
+    ghost_intent = CrewmateGhostMode().decide(belief, ActionState())
+    assert ghost_intent.point == (0, 0)
+
+
+def _map_with_danger_room() -> MapData:
+    return MapData(
+        width=1000,
+        height=1000,
+        tasks=(
+            TaskStation(name="hub", x=100, y=100, w=20, h=20),  # center (110, 110), in Storage Deck
+            TaskStation(name="safe", x=140, y=100, w=20, h=20),  # center (150, 110), outside
+        ),
+        vents=(),
+        rooms=(Room(name="Storage Deck", x=80, y=80, w=60, h=60),),
+        button=MapRect(x=0, y=0, w=28, h=34),
+        home=MapPoint(x=0, y=0),
+    )
+
+
+def test_danger_room_station_is_deprioritized_only_while_shadowed() -> None:
+    # The Storage-Deck survival tie-break: with a known-alive non-teammate near
+    # us, the slightly-nearer danger-room station loses the ordering; alone, the
+    # normal nearest-first routing is untouched (routing stays best-in-class).
+    def belief() -> Belief:
+        return Belief(
+            map=_map_with_danger_room(),
+            assigned_task_indices={0, 1},
+            visible_task_indices={0, 1},
+            self_world_x=115,
+            self_world_y=160,  # hub station marginally nearer than safe
+            last_tick=100,
+        )
+
+    alone = belief()
+    assert NormalMode().decide(alone, ActionState()).task_index == 0  # nearest wins
+
+    shadowed = belief()
+    shadowed.roster["red"] = PlayerRecord(
+        color="red", world_x=140, world_y=160, last_seen_tick=100, life_status="alive"
+    )
+    intent = NormalMode().decide(shadowed, ActionState())
+    assert intent.task_index == 1  # the danger-room station yields the tie-break
 
 
 def test_sweeps_baked_tasks_when_no_signals_arrive() -> None:
@@ -190,6 +265,63 @@ def test_ghost_picks_nearer_task_through_walls() -> None:
     assert intent.kind == "navigate_to_noclip"
     assert intent.task_index == 1
     assert intent.point == (32, 12)
+
+
+def test_targets_route_near_task_over_euclidean_near_task_across_a_wall() -> None:
+    # The station just across the wall is euclidean-nearest but a long walk
+    # around; route-aware ordering picks the genuinely closer station.
+    mask = np.ones((24, 64), dtype=bool)
+    mask[0:20, 24:28] = False  # wall with a gap at the bottom (y >= 20)
+    belief = Belief(
+        map=MapData(
+            width=64,
+            height=24,
+            tasks=(
+                TaskStation(name="across", x=28, y=2, w=4, h=4),  # center (30, 4): 10px away but around the wall
+                TaskStation(name="same-side", x=2, y=2, w=4, h=4),  # center (4, 4): 16px away, straight shot
+            ),
+            vents=(),
+            rooms=(),
+            button=MapRect(x=0, y=20, w=4, h=4),
+            home=MapPoint(x=2, y=22),
+        ),
+        assigned_task_indices={0, 1},
+        visible_task_indices={0, 1},
+        self_world_x=20,
+        self_world_y=4,
+    )
+    belief.nav = build_nav_graph(mask, map_data=belief.map, cell_size=4)
+    intent = NormalMode().decide(belief, ActionState())
+    assert intent.kind == "complete_task" and intent.task_index == 1
+
+
+def test_targets_the_chain_endpoint_over_the_middle_station() -> None:
+    # Stations on a line with us just left of the middle one: starting at the
+    # left endpoint finishes the chain with no backtrack; the pure
+    # nearest-station pick (the middle) would walk the leftmost twice.
+    belief = Belief(
+        map=MapData(
+            width=1000,
+            height=1000,
+            tasks=(
+                TaskStation(name="mid", x=190, y=100, w=20, h=20),  # center (200, 110)
+                TaskStation(name="left", x=90, y=100, w=20, h=20),  # center (100, 110)
+                TaskStation(name="right", x=490, y=100, w=20, h=20),  # center (500, 110)
+            ),
+            vents=(),
+            rooms=(),
+            button=MapRect(x=0, y=0, w=28, h=34),
+            home=MapPoint(x=0, y=0),
+        ),
+        assigned_task_indices={0, 1, 2},
+        visible_task_indices={0, 1, 2},
+        self_world_x=170,  # 30px from mid, 70px from left
+        self_world_y=110,
+    )
+    intent = NormalMode().decide(belief, ActionState())
+    # Scores: left first = 70 + (left->mid 100) + (mid->right 300) = 470;
+    # mid first = 30 + (mid->left 100) + (left->right 400) = 530. Left wins.
+    assert intent.kind == "complete_task" and intent.task_index == 1
 
 
 def test_ghost_completes_task_once_inside_station() -> None:

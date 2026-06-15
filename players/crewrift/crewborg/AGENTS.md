@@ -371,6 +371,63 @@ sprite; that sprite's **label** tells you what it is. Verified label vocabulary
   vote dots `10100 + target*MaxPlayers + voter` (base `notsus:167`, decoded
   `notsus:1827`).
 
+#### Contract delta — upstream changes of 2026-06-10 (verified against game source)
+
+Six upstream commits (`5d00d84`..`bc1fb99`) changed the `/player` contract; the
+facts below were verified against the game source at those commits and are
+implemented in crewborg's perception/belief (`perception/`, `types.py`):
+
+- **Edge culling fixed** (`5d00d84` "fix player edge culling"): players are now
+  culled by **sprite-rect overlap** with the 128×128 frame
+  (`playerActorInFrame`), not by their collision center being on-screen, and the
+  LoS check uses a **clamped in-frame point** (`playerActorVisibilityPoint`).
+  Consequence: player objects can arrive with screen coords slightly outside
+  0..127 (down to −(CrewSpriteSize+2)); a player straddling the screen edge is
+  now streamed where it previously vanished. No crewborg change needed (we never
+  filtered by screen bounds) — but don't add such a filter.
+- **Server tick marker** (`4f89e79` "add tick log marker"): every per-tick
+  player frame carries an invisible 1×1 sprite, **sprite id 5016 / object id
+  5016**, label **`tick <N>`** with `N = sim.tickCount` — the same counter the
+  `.bitreplay` timeline uses. The sprite is *redefined* each tick (label
+  changes). Crewborg folds it into `belief.server_tick` and records it per tick
+  in the artifact's `positions` table (the trace↔replay join key).
+- **Random default seed** (`fe49010`): config `seed` default changed from a
+  fixed `0xA6019`/`679961` to **−1 = time-based** (`resolveRandomSeed`,
+  `timeGameSeed`); explicit seeds and replays still reproduce. Role assignment
+  is therefore **no longer correlated with player color** across hosted
+  episodes — never bake color→role priors (crewborg has none).
+- **GameInfo interstitial** (`61b6c3c`): a new phase **`Lobby → GameInfo →
+  RoleReveal → …`** (default `gameInfoTicks` = 72 = 3 s, config-overridable)
+  shows text sprites (9000-range): `GAME INFO`, `KILL COOLDOWN <N>T`,
+  `TASKS <N> EACH`, `VOTE TIMER <N>T`, `GAME TIMER <N>T` / `GAME TIMER NONE` —
+  i.e. the **live episode config**. Crewborg learns
+  `kill_cooldown_config_ticks` / `tasks_per_player` / `vote_timer_ticks` /
+  `game_max_ticks` from it.
+- **MeetingCall interstitial** (`4b9297d`): `startVote` now enters a new
+  **`MeetingCall`** phase (const `MeetingCallTicks` = 72 = 3 s) before
+  `Voting`, exposing **who opened the meeting and how** (previously
+  unobservable): object **9800** = caller's `player <color> right` icon, object
+  **9801** = reported `body <color>` sprite (report) or the new
+  **`meeting button`** sprite (sprite id 5017; button call). Text lines:
+  `<Color> reported` + `<Color>'s body`/`a body`, `<Color> pressed` +
+  `the button`, `<Color> called` + `a meeting` (`Someone` when the caller
+  left). Inputs are ignored during MeetingCall. Crewborg latches
+  `meeting_called_by` / `meeting_trigger` / `meeting_reported_body_color` and
+  emits `domain.meeting_called`.
+- **Game clock paused in meetings** (`bc1fb99` "pause timer"): a new
+  `gameTickCount` advances **only during Playing**, and `maxTicks` now counts
+  task-phase ticks (MeetingCall/Voting/VoteResult no longer burn game clock).
+  Kill/vent cooldowns also only decrement during Playing, and every meeting
+  still resets imposter kill cooldowns. Defaults moved: **`VoteTimerTicks`
+  240 → 1200** (10 s → 50 s) and **`KillCooldownTicks` is 500** (the §2 table's
+  900 is stale). Crewborg prefers the GameInfo-advertised values and keeps
+  conservative fallbacks (240 / 500) for older servers.
+- Also new on the GameOver screen: per-player roster icons (objects **9700+i**,
+  `player <color>`) row-paired with **`IMP`/`CREW`** text items — an
+  end-of-game ground-truth **role census by color** (struck-through pixels mark
+  the dead; the label does not change). The no-ejection vote result now reads
+  `NO ONE` + `DIED`.
+
 **Vents, rooms, and the emergency button are NOT objects** — they're baked into
 the `map` sprite's pixels (`buildMapSpritePixels`, `global:701`). crewborg can't
 read their positions from the stream; get them from the static map /
@@ -463,7 +520,14 @@ source-verified recipe: [`docs/crewrift-replays.md`](./docs/crewrift-replays.md)
 ### Packaging & submission (the Coworld path)
 
 Crewborg ships as a Linux/amd64 Docker image; **stdout = protocol channel,
-stderr = logs/traces**. Upload/submit with the `coworld` CLI:
+stderr = logs/traces**. Trace/metric logging defaults to the **episode debug
+artifact** rather than stderr: `artifact.py` records the full unfiltered stream
+into in-memory SQLite and, at episode end, the bridge zips `trace.db` +
+`summary.json` and PUTs them to the runner-injected
+`COWORLD_PLAYER_ARTIFACT_UPLOAD_URL` (presigned `https://`, or `file://` on
+local runs; absent ⇒ skip; failure logged, never fatal — see README §"Logging &
+the episode artifact"). Stderr JSON streaming is opt-in via the
+`CREWBORG_TRACE*` envs. Upload/submit with the `coworld` CLI:
 ```sh
 docker buildx build --platform linux/amd64 -t crewborg:latest --load .
 coworld upload-policy crewborg:latest --name crewborg

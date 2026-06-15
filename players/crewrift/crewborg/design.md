@@ -289,6 +289,13 @@ ghosts and during meetings (no camera).
 - **chat** — `chat_log`: the current meeting's transcript (`(tick, speaker_color,
   text)`), de-duplicated across the per-tick re-render and cleared when a new
   meeting opens. Raw material for suspicion reasoning.
+- **social history** — episode-persistent (never cleared): `accusations`, the
+  who-sus'd-who graph parsed from every meeting chat line
+  (`strategy/meeting/social.py`: color mentions classified accuse/defend per
+  clause), and `meeting_history`, one `MeetingRecord` per meeting with the final
+  vote tally (voter color → target color or `skip`, refreshed from the live dots
+  each Voting tick) and the ejected color. Feeds the social suspicion cues
+  (§10.1) and the meeting LLM context (§10.3).
 - **tasks** — assigned task indices (from `task_signals` ids), per-task world
   location (from the map), per-task completion; `crew_tasks_remaining`;
   `task_arrows_enabled` (below).
@@ -489,7 +496,7 @@ re-decides.
 |---|---|---|
 | **Normal** | default while `Playing` | target the nearest reachable **signalled** task (live arrows+bubbles = the remaining tasks) and `complete_task(T)`; conclude `T` done when its **bubble disappears**, gated on having seen ≥ `COMPLETION_PROGRESS_PCT` (≈90%) progress (so an occlusion/edge flicker doesn't false-complete); when **no task signal remains**, `navigate_to` the spawn / **start room** rather than standing still |
 | **Crewmate Ghost** | `self_role == "dead"` while `Playing` | reuse Normal's task bookkeeping, but travel to task centers with `navigate_to_noclip` so walls do not constrain pathing; once inside the task rect, `complete_task(T)` holds A exactly like Normal |
-| **Attend Meeting** | phase = `Voting` | `chat(text)`, then `vote` the top suspect (`P(imp) ≥ VOTE_PROBABILITY`, §10.1) else skip, before the timer |
+| **Attend Meeting** | phase = `Voting` | `chat(text)`, then `vote` per the game-theory vote policy (`strategy/meeting/vote_policy.py`): the top suspect over a **state-dependent bar** (0 in a must-eject endgame, up to 0.9 when the margin is tight), with a near-deadline **anti-split swap** onto the plurality, else skip — always cast before the timer |
 | **Dick Mode** | opt-in with `CREWBORG_DICK_MODE=1`; live crewmate, one-shot, and first kill cooldown is within the worst-case button walk plus buffer | while `Playing`, `call_meeting`; during the triggered meeting only if our button press opened it, `chat("haha, fuck you imposters")`, then skip-vote until the meeting closes |
 | **Report Body** | a body is in view | `report(body_id)`; yields when a meeting opens |
 | **Flee** | a believed-imposter is approaching | `flee_from(player)`, or a strategic `navigate_to(point)` |
@@ -662,7 +669,10 @@ targets) use their live position.
   position every `REPLAN_INTERVAL` ticks** (and whenever the goal changes), so the
   follower never commits to a stale route after drifting off the planned line — A*
   is ~0.2 ms, so this is nearly free and is what eliminates residual approach-wedging.
-- Vote-cursor stepping then A-confirm.
+- Vote-cursor stepping then A-confirm — with a **last-resort confirm**: the cursor
+  walk is budgeted (`vote_steps`, ~two laps of the candidate grid); past the budget
+  the resolver confirms wherever the cursor is, because any vote beats the −10
+  no-vote penalty (a cursor/grid that never decodes must not spin DOWN forever).
 - Chat buffering + ASCII validation (emit only during Voting).
 - Hand the held mask to the bridge, which de-dups (send-only-on-change).
 
@@ -774,9 +784,13 @@ Crewmate-only — an imposter knows the truth (suspicion cleared, never flees), 
 does a ghost.
 
 **Prior.** With `P` players and `K` imposters, a crewmate knows the `K` are among
-the other `P − 1`, so each other player's marginal prior is `K / (P − 1)`. `K` is
-derived from the player count via the game's auto formula `(P − 3) // 2`
-(`sim.nim:1387`; `effectiveImposterCount`), overridable by `belief.imposter_count`.
+the other `P − 1`. The prior **redistributes the imposter budget** as the game
+reveals information: an *unconfirmed* player's marginal prior is the hidden budget
+over the remaining candidates — `max(0, K − |confirmed|) / (P − 1 − dead −
+confirmed_alive)` — so catching one of two imposters roughly halves everyone
+else's prior. `K` is derived from the player count via the game's auto formula
+`(P − 3) // 2` (`sim.nim:1387`; `effectiveImposterCount`), overridable by
+`belief.imposter_count`.
 
 **Update (log-odds Bayes).** `logit(P) = logit(prior) + Σ logLR(e)` over observed
 evidence `e`. Each graded cue's `logLR` is a **function of the event's features**
@@ -804,19 +818,27 @@ overwhelming `logLR` (`WITNESSED_LOG_LR = ln 1e6 ⇒ P ≈ 1`), not a special ca
   reporter), and **follow-to-death** (log-LR *increases* with how long the shadowing
   of a now-dead victim lasted). A single graded cue lands below `FLEE_PROBABILITY`,
   so graded fleeing needs corroboration.
+- **Social cues** (`_social_log_lr`) over the episode accusation graph +
+  meeting vote history (§5 social history): *defended by a confirmed imposter*
+  (up — teammates defend each other), *accused by a confirmed imposter* (down —
+  imposters scapegoat crew, so their speech is inverted evidence), *crowd
+  accusation* by ≥2 independent ordinary speakers (weakly up), and *voted to
+  eject a confirmed imposter* (down — crew-like; the model's first exculpatory
+  terms). Each is boolean per player, so the contribution is bounded.
 
 Deliberately **excluded** as too noisy (an innocent reporter is next to the body;
 crew cluster while tasking): brief proximity, single-body passing, and *task dwell*
 as exculpation (imposters fake tasks).
 
 v1 simplifications (documented for later): **naive-Bayes** independence between
-evidence types; **positive-evidence-only** (no exculpatory terms — the prior is the
-baseline); and a **static** `K / (P − 1)` prior without redistributing the imposter
-budget as players are confirmed or die (a proper joint model is a refinement). Still
-future evidence for the deterministic Bayesian model: *area-recency*,
-*alibi clearing*, *vote-tally* bandwagons (census-mapped `voting.dots`), and
-*chat semantics* (`chat_log`, §4.3). The meeting LLM already sees those signals
-as serialized context, but it does not write back durable suspicion facts.
+evidence types, and a **marginal** (not joint) prior — the imposter budget is
+redistributed as players are confirmed or die, but a proper joint model over the
+full K-imposter assignment is a refinement. Chat semantics and vote history now
+feed the social cues; still-future evidence for the deterministic Bayesian model:
+*area-recency*, *alibi clearing*, richer cross-meeting patterns (mutual-defense
+pairs, vote-bloc correlation), and an absence/exculpation model beyond the social
+terms. The meeting LLM sees all of those signals as serialized context, but it
+does not write back durable suspicion facts.
 
 ### 10.2 Agent location tracking (`agent_tracking.py`)
 
@@ -858,7 +880,8 @@ two backends:
 
 Without a viable backend (a flag plus the matching credentials), the mode
 preserves the deterministic fallback (`"no read, skipping"` once, then the
-Bayesian `top_suspect` vote or skip).
+game-theory `vote_policy.fallback_vote` — the Bayesian top suspect over the
+state-dependent bar, or skip).
 
 Configuration is resolved at the strategy boundary, never inside the mode.
 `RuleBasedStrategy` reads these environment variables once at construction (via
@@ -868,11 +891,22 @@ directive as `MeetingParams`; the mode builds its client from those params
 env-free — the strategy owns all behavior configuration, the same way it gates the
 aggressive imposter selector (§10).
 
-The implementation is split into four portable pieces under `strategy/meeting/`:
+The implementation is split into six portable pieces under `strategy/meeting/`:
 
+- `social.py` parses each chat line into who-sus'd-who `(target, stance)` pairs
+  (color mentions, longest-first; clauses classified accuse/defend by keyword) —
+  `update_belief` folds them into the episode-persistent `belief.accusations`.
+- `vote_policy.py` owns the game-theory vote: `imposters_remaining` (K-budget
+  tracking), the state-dependent `vote_bar` with the must-eject endgame rule,
+  `anti_split_swap` (near-deadline plurality convergence), and the per-role
+  `fallback_vote` (crewmate top-suspect-over-bar; imposter joins the crew
+  plurality on a non-teammate).
 - `context.py` serializes `Belief` into explicit meeting state: timer estimate,
   self/team, legal vote targets, candidate grid, vote tally, chat transcript,
-  roster, event summaries, and suspicion ranking/fallback vote. `valid_vote_targets`
+  roster, event summaries, suspicion ranking/fallback vote, the `social` record
+  (accusation graph + prior meetings' votes/ejections), and the `game_state`
+  payload (alive/imposter counts, must-eject flag, plurality target, anti-split
+  recommendation). `valid_vote_targets`
   is the single chokepoint for vote legality — it excludes self, and, when we are
   the imposter, our teammates. Because the LLM menu, the decision validator, and
   the submit-time re-check all read it, this **enforces** the imposter prompt's
@@ -887,8 +921,11 @@ The implementation is split into four portable pieces under `strategy/meeting/`:
   (per-role tactics — the knob to tune). `build_system_prompt(role)` templates
   them; the crewmate and imposter strategies are edited independently and never
   touch each other or the shared contract. Imposter tactics include never voting
-  or accusing a teammate and deflecting toward a plausible crewmate; the crewmate
-  prompt leans on `state.fallback_vote` and the suspicion ranking. Unknown /
+  or accusing a teammate, deflecting toward a plausible crewmate, and voting with
+  the crew plurality; the crewmate prompt leans on `state.fallback_vote`, the
+  suspicion ranking, the social record (mutual-defense pairs, inverted evidence
+  from caught imposters), and the `game_state` rules (never skip in a must-eject
+  endgame; converge near the deadline to avoid vote splits). Unknown /
   not-yet-revealed (`None`) / ghost (`dead`) roles resolve to the crewmate prompt
   so imposter tactics are never disclosed to a non-imposter. The client picks the
   prompt from `context.self.role` at call time, so no role plumbing is needed
@@ -1049,8 +1086,8 @@ structural, and each still awaits tuning against a live server.
 | Movement-controller style | bang-bang + a release-near-target deadband with a predictive stop — release an axis within the estimated momentum stopping distance so the agent coasts onto the target instead of overshooting |
 | Path clearance | `CLEARANCE_RADIUS = 2` px config-space margin (routes keep off walls) |
 | Re-plan cadence | `REPLAN_INTERVAL = 8` ticks (re-root the route at the live position; A* ≈ 0.2 ms) |
-| Voting policy | vote the highest-posterior live suspect when `P(imp) ≥ VOTE_PROBABILITY` (§10.1), else **skip** — but always cast *something* before the timer (not voting costs −10) |
-| LLM meetings | opt-in with `CREWBORG_LLM_MEETINGS=1` + `ANTHROPIC_API_KEY` (direct), or a Bedrock flag (`USE_BEDROCK=1` / `CREWBORG_USE_BEDROCK=1` / `CLAUDE_CODE_USE_BEDROCK=1`) + AWS env credentials; default model `claude-haiku-4-5-20251001` (direct) or `us.anthropic.claude-haiku-4-5-20251001-v1:0` (Bedrock), overridable via `CREWBORG_LLM_MODEL`; deadline LLM prompt at ≤96 ticks remaining and auto-submit at ≤48 ticks remaining; chat cooldown is 100 ticks |
+| Voting policy | game-theory vote policy (`strategy/meeting/vote_policy.py`): crewmate votes the highest-posterior live non-self/non-teammate suspect over a **state-dependent bar** — 0.75 at margin ≥ 4, 0.8 at margin 3, 0.9 at margin ≤ 2, and **0 in a must-eject endgame** (crew within one of parity: a skip loses to the next kill) — else **skip**; within `ANTI_SPLIT_REMAINING_TICKS = 96` of the deadline a trailing vote swaps onto the plurality if it is plausibly guilty (`ANTI_SPLIT_MIN_PROBABILITY = 0.3`); the **imposter** joins the crew plurality on a non-teammate (else skips). Always cast *something* before the timer (not voting costs −10): auto-submit at ≤ `AUTO_SUBMIT_REMAINING_TICKS = 72`, and the action layer's last-resort confirm (§9) bounds the cursor walk |
+| LLM meetings | opt-in with `CREWBORG_LLM_MEETINGS=1` + `ANTHROPIC_API_KEY` (direct), or a Bedrock flag (`USE_BEDROCK=1` / `CREWBORG_USE_BEDROCK=1` / `CLAUDE_CODE_USE_BEDROCK=1`) + AWS env credentials; default model `claude-haiku-4-5-20251001` (direct) or `us.anthropic.claude-haiku-4-5-20251001-v1:0` (Bedrock), overridable via `CREWBORG_LLM_MODEL`; deadline LLM prompt at ≤96 ticks remaining and auto-submit at ≤72 ticks remaining (the backstop runs ahead of every path — LLM, deterministic, or failing client); chat cooldown is 100 ticks |
 | Aggressive imposter selector | opt-in with `CREWBORG_BE_DUMB=1` or `BE_DUMB=1`; during `Playing`, imposters skip Pretend/Evade/ReportBody and always select Search unless kill-ready with a visible victim, then Hunt |
 | Dick Mode selector | opt-in with `CREWBORG_DICK_MODE=1` or `DICK_MODE=1`; live crewmates make one emergency-button call when `ticks_until_kill_ready <= DICK_MAX_BUTTON_TRAVEL_TICKS + DICK_KILL_COOLDOWN_BUFFER_TICKS`; `DICK_MAX_BUTTON_TRAVEL_TICKS = 600`, `DICK_KILL_COOLDOWN_BUFFER_TICKS = 10`; chat `haha, fuck you imposters` only when our recorded button press opened the meeting, skip-vote, then resume; refused calls time out after `DICK_CALL_NO_MEETING_GRACE_TICKS = 48` and do not re-arm |
 | Report policy | crewmates always report visible bodies; imposters evade for `EVADE_TICKS = 72` after their own kill, then may report a non-fresh visible body (§7.2). Suspicion-aware reporting is a possible refinement |

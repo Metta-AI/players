@@ -38,13 +38,19 @@ TRACK_WINDOW_TICKS = 120
 TEAMMATE_CLAIM_RADIUS = 80
 
 # The kill cooldown's full length (ticks), used to estimate time-to-ready before we
-# have measured a real cooldown from the binary HUD (design §7.2). The game default.
-DEFAULT_KILL_COOLDOWN_TICKS = 900
+# have measured a real cooldown from the binary HUD (design §7.2) and before the
+# pre-game GAME INFO interstitial has taught the live value
+# (``belief.kill_cooldown_config_ticks``). The game default — sim.nim
+# KillCooldownTicks = 500, verified upstream 2026-06-10 (was 900 in older builds).
+DEFAULT_KILL_COOLDOWN_TICKS = 500
 
 # Enter Search this many ticks before the kill comes off cooldown. Search finds
 # and follows a victim; Hunt only activates once the kill is ready and a victim is
-# visible.
-SEARCH_LEAD_TICKS = 100
+# visible. Widened 100 → 160 for v4 to close the measured ~160-tick conversion
+# gap vs truecrew:v14 (their imps_win episodes end at median tick 2846 vs our
+# 3003; our teammate visibly out-kills us): start acquiring/shadowing the next
+# victim earlier so the kill converts the moment the cooldown clears.
+SEARCH_LEAD_TICKS = 160
 
 # Backwards-compatible name for docs/tests that still refer to the old Hunt lead
 # term. New code should use SEARCH_LEAD_TICKS.
@@ -59,22 +65,41 @@ def kill_urgency_ticks(belief: Belief) -> int:
     return max(0, belief.last_tick - belief.kill_ready_since_tick)
 
 
+def kill_cooldown_duration_ticks(belief: Belief) -> int:
+    """The kill cooldown's full length: measured > game-info config > game default.
+
+    A cooldown actually watched run to ready (``kill_cooldown_estimate``) is the
+    ground truth; otherwise the pre-game GAME INFO interstitial's advertised
+    ``killCooldownTicks`` (``kill_cooldown_config_ticks``); otherwise the compiled
+    game default.
+    """
+
+    return (
+        belief.kill_cooldown_estimate
+        or belief.kill_cooldown_config_ticks
+        or DEFAULT_KILL_COOLDOWN_TICKS
+    )
+
+
 def ticks_until_kill_ready(belief: Belief) -> int:
     """Estimated ticks until the kill becomes available (0 if ready now).
 
     The HUD is binary (ready / cooldown, no countdown), so this reconstructs the
-    countdown from the tracked cooldown start (`kill_cooldown_start_tick`) plus the
-    learned duration (`kill_cooldown_estimate`, falling back to the game default
-    before anything has been measured). With no cooldown start observed yet it
-        assumes a full cooldown remains, so callers won't enter Search on no
-        information.
+    countdown from the tracked cooldown start (`kill_cooldown_start_tick`) plus
+    the cooldown length (:func:`kill_cooldown_duration_ticks`). With no cooldown
+    start observed yet it assumes a full cooldown remains, so callers won't enter
+    Search on no information. Note the cooldown only runs during Playing — the
+    game clock (and the cooldown) pause during meetings (upstream 2026-06-10) —
+    but ``kill_cooldown_start_tick`` is re-anchored on every meeting→Playing
+    transition (the server resets the cooldown after each meeting), so the
+    estimate never spans a meeting.
     """
 
     if belief.self_kill_ready:
         return 0
+    duration = kill_cooldown_duration_ticks(belief)
     if belief.kill_cooldown_start_tick is None:
-        return DEFAULT_KILL_COOLDOWN_TICKS
-    duration = belief.kill_cooldown_estimate or DEFAULT_KILL_COOLDOWN_TICKS
+        return duration
     return max(0, belief.kill_cooldown_start_tick + duration - belief.last_tick)
 
 
@@ -129,6 +154,19 @@ def select_victim(belief: Belief) -> PlayerRecord | None:
     unclaimed = [target for target in candidates if not _claimed_by_teammate(target, belief, self_xy)]
     if unclaimed:
         candidates = unclaimed
+    # Hunter profile (strategy.hunter): a crewmate at the emergency button during
+    # the stakeout window is walking in to reset our kill cooldown (sussyboi's
+    # timed jam) — killing it denies the reset, so it outranks isolation.
+    from players.crewrift.crewborg.strategy.hunter import (
+        button_approachers,
+        hunter_enabled,
+        stakeout_window_active,
+    )
+
+    if hunter_enabled() and stakeout_window_active(belief):
+        approachers = button_approachers(belief, candidates)
+        if approachers:
+            candidates = approachers
     # Prefer the most isolated (largest gap to its nearest other crewmate), then nearest.
     return max(candidates, key=lambda t: (_isolation(t, belief), -_dist2(self_xy, (t.world_x, t.world_y))))
 

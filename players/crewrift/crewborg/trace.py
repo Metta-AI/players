@@ -1,10 +1,13 @@
-"""Trace and metrics sinks that emit newline-delimited JSON to stderr.
+"""Trace and metrics sinks: tee fan-out + newline-delimited JSON to stderr.
 
 The Coworld contract is **stdout = protocol channel, stderr = logs/traces**
 (design §11, AGENTS.md §"Packaging"). These sinks satisfy the SDK's ``TraceSink``
-and ``MetricsSink`` protocols (:mod:`players.player_sdk.trace`) and write one JSON
-object per line to stderr so a log collector can parse them without touching the
-protocol stream.
+and ``MetricsSink`` protocols (:mod:`players.player_sdk.trace`). The stderr-JSON
+sinks write one JSON object per line so a log collector can parse them without
+touching the protocol stream; they are opt-in via the ``CREWBORG_TRACE*`` envs.
+The primary sink is the SQLite episode recorder uploaded as the player debug
+artifact (:mod:`players.crewrift.crewborg.artifact`); ``TeeTraceSink`` /
+``TeeMetricsSink`` fan one stream out to both.
 """
 
 from __future__ import annotations
@@ -226,6 +229,36 @@ def _parse_patterns(raw: str) -> tuple[str, ...]:
 
 def _split_tokens(raw: str) -> tuple[str, ...]:
     return tuple(part for chunk in raw.replace(";", ",").split(",") for part in chunk.lower().split() if part)
+
+
+class TeeTraceSink:
+    """Fan one trace stream out to several sinks (``None`` entries are skipped)."""
+
+    def __init__(self, *sinks: Any) -> None:
+        self._sinks = tuple(sink for sink in sinks if sink is not None)
+
+    def record(self, event: TraceEvent) -> None:
+        for sink in self._sinks:
+            sink.record(event)
+
+
+class TeeMetricsSink:
+    """Fan metric samples out to several sinks (``None`` entries are skipped)."""
+
+    def __init__(self, *sinks: Any) -> None:
+        self._sinks = tuple(sink for sink in sinks if sink is not None)
+
+    def counter(self, name: str, value: float = 1.0, tags: dict[str, Any] | None = None) -> None:
+        for sink in self._sinks:
+            sink.counter(name, value, tags)
+
+    def histogram(self, name: str, value: float, tags: dict[str, Any] | None = None) -> None:
+        for sink in self._sinks:
+            sink.histogram(name, value, tags)
+
+    def gauge(self, name: str, value: float, tags: dict[str, Any] | None = None) -> None:
+        for sink in self._sinks:
+            sink.gauge(name, value, tags)
 
 
 class StderrJsonTraceSink:

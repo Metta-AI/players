@@ -126,6 +126,7 @@ def _reset_execution(action_state: ActionState, intent: Intent) -> None:
     action_state.route_teleports = {}
     action_state.ticks_since_plan = 0
     action_state.vote_confirmed = False
+    action_state.vote_steps = 0
     action_state.chat_sent = False
 
 
@@ -345,11 +346,19 @@ def _resolve_vote(intent: Intent, belief: Belief, action_state: ActionState) -> 
     has died) falls back to skip so we still vote and avoid the no-vote penalty
     (design §12). The cursor steps with edge-triggered presses; stepping DOWN cycles
     through every alive cell + skip, so it always reaches the goal.
+
+    Last resort: if the cursor walk exceeds its step budget (~two full laps of the
+    grid) without landing where we wanted — a cursor/grid that never decodes, or a
+    cursor the server isn't moving — confirm wherever the cursor is. Any vote beats
+    the −10 no-vote penalty.
     """
 
     if action_state.vote_confirmed:
         return Command(held_mask=0)
     voting = belief.voting
+
+    if action_state.vote_steps > _vote_step_budget(len(voting.candidates)):
+        return _confirm_vote(action_state)
 
     if intent.target_color is not None:
         target_slot = next(
@@ -358,12 +367,31 @@ def _resolve_vote(intent: Intent, belief: Belief, action_state: ActionState) -> 
         if target_slot is not None:
             if voting.cursor_slot == target_slot:
                 return _confirm_vote(action_state)
-            return Command(held_mask=_edge_press(action_state, BTN_DOWN))  # step toward the target
+            return Command(held_mask=_vote_step(action_state))  # step toward the target
 
     # Skip policy (default, or target unresolvable): step onto the skip cell, confirm.
     if voting.skip_cursor_present:
         return _confirm_vote(action_state)
-    return Command(held_mask=_edge_press(action_state, BTN_DOWN))
+    return Command(held_mask=_vote_step(action_state))
+
+
+# Floor of the cursor-step budget: covers two laps of a full 8-player grid even
+# when the candidate grid has not decoded yet (so ``len(candidates)`` is 0).
+VOTE_STEP_BUDGET_MIN = 20
+
+
+def _vote_step_budget(candidate_count: int) -> int:
+    """Registered DOWN presses allowed before the last-resort confirm: ~two full
+    laps of the candidate grid (+ skip), floored for an undecoded grid."""
+
+    return max(VOTE_STEP_BUDGET_MIN, 2 * (candidate_count + 2))
+
+
+def _vote_step(action_state: ActionState) -> int:
+    press = _edge_press(action_state, BTN_DOWN)
+    if press:  # only registered (fresh) presses advance the cursor
+        action_state.vote_steps += 1
+    return press
 
 
 def _confirm_vote(action_state: ActionState) -> Command:
@@ -393,6 +421,33 @@ def _resolve_flee(
     return Command(held_mask=_movement_mask(self_xy, away, _velocity(action_state, self_xy)))
 
 
+# Inflate the no-kill-press zone around the emergency-button rect by this many
+# pixels: server- and client-side positions can disagree by a tick or two of
+# momentum, and a misfired button call is catastrophic for an imposter.
+BUTTON_ZONE_MARGIN_PX = 4
+
+
+def _inside_button_zone(belief: Belief, self_xy: tuple[int, int]) -> bool:
+    """Whether ``self_xy`` is on (or within a safety margin of) the emergency button.
+
+    The server's A-press order is tryReport → tryCallButton → tryKill and the
+    first success short-circuits (sim.nim applyInput), so a kill press from
+    inside the button's trigger area opens a meeting instead of killing —
+    spending our one button call and resetting every imposter kill cooldown.
+    The 2026-06-11 v8 0.1.52 eval caught exactly this 3× (Hunt strikes at the
+    bridge button); 2 of those episodes were imposter losses.
+    """
+
+    if belief.map is None:
+        return False
+    button = belief.map.button
+    m = BUTTON_ZONE_MARGIN_PX
+    return (
+        button.x - m <= self_xy[0] < button.x + button.w + m
+        and button.y - m <= self_xy[1] < button.y + button.h + m
+    )
+
+
 def _resolve_kill(
     intent: Intent, belief: Belief, action_state: ActionState, self_xy: tuple[int, int]
 ) -> Command:
@@ -402,7 +457,12 @@ def _resolve_kill(
     target_xy = (target.world_x, target.world_y)
     if _dist2(self_xy, target_xy) <= KILL_RANGE_SQ:
         # In range: a fresh A press kills (sim.nim tryKill). Caveat: if a body is
-        # adjacent, the server reports it instead — Hunt avoids that case.
+        # adjacent, the server reports it instead — Hunt avoids that case. A
+        # press from the emergency-button zone calls a meeting instead of
+        # killing (see _inside_button_zone) — keep closing on the victim until
+        # we are off the button.
+        if _inside_button_zone(belief, self_xy):
+            return Command(held_mask=_navigate_mask(belief, action_state, self_xy, target_xy))
         return Command(held_mask=_edge_press(action_state, BTN_A))
     return Command(held_mask=_navigate_mask(belief, action_state, self_xy, target_xy))
 
