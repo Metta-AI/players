@@ -1,0 +1,22 @@
+{
+  "name": "agricogla-symbolic-planner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/planner-player.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/planner-player.js --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx smoke.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.0"
+  }
+}
