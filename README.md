@@ -1,5 +1,10 @@
 # players
 
+> **Archived:** This repository has moved to
+> [`Metta-AI/coworld-tools/players`](https://github.com/Metta-AI/coworld-tools/tree/main/players). This repository
+> remains available read-only for existing clones, links, branches, and tags. Make new changes in
+> `coworld-tools/players/`.
+
 Single-source repository for the development and internal publication of
 players for [Coworld](https://github.com/Metta-AI/metta/tree/main/packages/coworld)
 games. Players developed here are intended to be the canonical, shareable
